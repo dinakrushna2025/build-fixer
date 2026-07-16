@@ -1,0 +1,34 @@
+{
+  "summary": "First backend test run for Mobile Build Resolver. All 28 pytest cases PASSED against the live preview backend (which proxies live Redash / deployer / deployer-MCP / expo-MCP). Health, diagnose (known + unknown job), sensitive-field redaction, diagnose logs, expo lookup+builds (401 as expected), identity iOS/Android (validation + surfacing), keystore GET (+ invalid user_id 400) + DER-upload rejection, clear-asc preview & execute, testflight-retry, fingerprint lookup + bad-archive URL, force-regen platform validation + iOS/Android execution, PEM extract-upload-key + P8 encrypt (kubectl-missing surfaced gracefully, not 500), MCP deployer passthrough, and audit log writes -- all verified.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_backend.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is ~700 lines and mixes routing + SQL constants + keystore-conversion helper (_convert_keystore_to_pem) + redaction. Consider splitting into routers/ (diagnose.py, keystore.py, creds.py, pem.py, mcp.py) and moving Q_* constants + _convert_keystore_to_pem into dedicated modules. Not blocking but future-proofing.",
+    "force_regen returns Redash's raw response including 'ok' and 'error' fields but no explicit status_code -- consider surfacing a normalised {reachable, status_code, error} shape for parity with deployer_client responses.",
+    "audit.log is fire-and-forget awaited; if Mongo is slow it will block the request. Consider background task (BackgroundTasks / asyncio.create_task with error logging) for destructive endpoints.",
+    "keystore_upload catches Exception broadly when computing auto_fingerprint (line 428) -- fine, but log the exception at WARN so operators can diagnose bad PEMs later.",
+    "redact_row only redacts top-level keys; if a nested dict ever carries these keys they will leak. Current queries never return nested JSON so this is theoretical."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_backend.py (new)",
+    "/app/test_reports/pytest/pytest_results.xml (generated)"
+  ],
+  "success_rate": {"backend": "100% (28/28)", "frontend": "n/a (skipped per request)"},
+  "test_credentials": "none required (VPN-only tool, no login)",
+  "seed_data_creation": "none; used JOB=41b30fe6-9d40-4818-b76f-df7bac4858e7 which is a real stale job in Redash",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend is fully green against live endpoints. The pytest file /app/backend/tests/test_backend.py is idempotent and safe to re-run (destructive endpoints only touch a known-stale test job). If a future run needs a fresh job_id, fetch one via `SELECT job_id FROM android_app_configs ORDER BY created_at DESC LIMIT 3` through /api/diagnose or a manual Redash curl (REDASH_API_KEY in backend/.env). Frontend testing was explicitly out of scope."
+}
