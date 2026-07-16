@@ -70,10 +70,52 @@ def fingerprints_from_bytes(artifact: bytes) -> dict[str, Any]:
     }
 
 
-async def fingerprints_from_url(url: str, timeout: float = 60) -> dict[str, Any]:
-    """Download an APK/AAB then compute fingerprints."""
-    import httpx  # local import to keep signing.py cheap on cold start
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
-        r = await c.get(url)
+async def download_artifact(url: str, dest: str) -> str:
+    """
+    Download an APK/AAB artifact to `dest`.
+
+    Rules (per user spec):
+      - Do NOT rewrite the URL. The DB stores expo.dev links; we hit those
+        directly and let redirects resolve to the signed download.
+      - Follow redirects (expo.dev artifact links are signed 302s).
+      - Attach `Authorization: Bearer $EXPO_TOKEN` only when the URL host is
+        expo.dev and EXPO_TOKEN is configured (private-org artifacts).
+    """
+    import os
+    import httpx  # local import to keep module cheap on cold start
+
+    if url.startswith("gs://"):
+        raise ValueError(f"GCS path is not directly downloadable: {url}")
+
+    headers: dict[str, str] = {}
+    token = os.environ.get("EXPO_TOKEN", "")
+    if token and "expo.dev" in url:
+        headers["Authorization"] = f"Bearer {token}"
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=180) as c:
+        r = await c.get(url, headers=headers)
         r.raise_for_status()
-        return fingerprints_from_bytes(r.content)
+        with open(dest, "wb") as f:
+            f.write(r.content)
+    return dest
+
+
+async def fingerprints_from_url(url: str, timeout: float = 180) -> dict[str, Any]:
+    """
+    Download the artifact via `download_artifact` (which handles expo.dev
+    auth + redirects correctly) then extract SHA-1 / SHA-256 fingerprints.
+    """
+    import os
+    import tempfile
+
+    fd, path = tempfile.mkstemp(prefix="mbr-fp-", suffix=".artifact")
+    os.close(fd)
+    try:
+        await download_artifact(url, path)
+        with open(path, "rb") as f:
+            return fingerprints_from_bytes(f.read())
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass

@@ -171,6 +171,19 @@ WHERE a.id = '{{ app_id }}'
 Q_APP_BY_JOB_IOS = "SELECT app_id FROM ios_app_configs WHERE job_id = '{{ job }}'"
 Q_APP_BY_JOB_ANDROID = "SELECT app_id FROM android_app_configs WHERE job_id = '{{ job }}'"
 
+Q_APP_VIA_PIPELINE = """
+SELECT a.name AS app, a.id AS app_id, a.expo_id, ea.owner AS expo_owner
+FROM apps a
+LEFT JOIN expo_accounts ea ON ea.id = a.expo_id
+WHERE a.name IN (
+    SELECT DISTINCT deployment_name FROM pipeline_runs
+    WHERE app = (SELECT name FROM apps WHERE id = '{{ job }}')
+      AND deployment_name IS NOT NULL
+)
+ORDER BY (a.expo_id IS NOT NULL) DESC
+LIMIT 1
+""".strip()
+
 Q_FINGERPRINT_UNION = """
 SELECT 'v3' AS src, job_id, app_name, package_name, key_alias, keystore_path, apk_url, aab_url
 FROM android_app_configs_v3 WHERE job_id = '{{ job }}'
@@ -290,34 +303,32 @@ async def expo_lookup(body: ExpoLookupBody):
     if not body.app_id and not body.job_id:
         raise HTTPException(400, "Provide app_id or job_id")
 
-    app_id = body.app_id
-    resolved_from = None
-    if not app_id:
-        # try ios first, then android
-        r = await redash_client.execute(Q_APP_BY_JOB_IOS, {"job": body.job_id})
-        rows = r.get("rows") or []
-        if rows and rows[0].get("app_id"):
-            app_id = str(rows[0]["app_id"])
-            resolved_from = "ios_app_configs"
-        else:
-            r = await redash_client.execute(Q_APP_BY_JOB_ANDROID, {"job": body.job_id})
-            rows = r.get("rows") or []
-            if rows and rows[0].get("app_id"):
-                app_id = str(rows[0]["app_id"])
-                resolved_from = "android_app_configs"
-        if not app_id:
-            return {"found": False, "reason": "job_id not present in ios/android configs",
-                    "app_id": None, "resolved_from": None}
+    # apps.id IS the job id -- resolve directly, no config indirection.
+    app_id = body.app_id or body.job_id
+    resolved_from = None if body.app_id else "apps.id"
 
     q = await redash_client.execute(Q_APP_BY_ID, {"app_id": app_id})
     row = _first(q.get("rows", []))
+
+    # Fallback: the id matched no apps row -> resolve the slug via pipeline_runs.
+    if not row and body.job_id:
+        q2 = await redash_client.execute(Q_APP_VIA_PIPELINE, {"job": body.job_id})
+        row = _first(q2.get("rows", []))
+        if row:
+            resolved_from = "pipeline_runs.deployment_name"
+
+    if not row:
+        return {"found": False,
+                "reason": "no apps row for that id and no pipeline_runs match",
+                "app_id": app_id, "resolved_from": None}
+
     return {
-        "found": bool(row),
+        "found": True,
         "app_id": app_id,
         "resolved_from": resolved_from,
         "row": row,
         "query": Q_APP_BY_ID,
-        "empty_expo": bool(row and not row.get("expo_id")),
+        "empty_expo": bool(not row.get("expo_id")),
     }
 
 

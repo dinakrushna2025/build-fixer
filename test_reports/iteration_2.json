@@ -1,0 +1,34 @@
+{
+  "summary": "Bug-fix verification (iteration 2) for the signing fingerprint feature. All 11 targeted tests PASSED. The download_artifact fix is verified end-to-end: (a) real F-Droid APK (~12MB) fingerprinted via /api/fingerprint/from-upload returns colon-hex sha1(20)/sha256(32) with subject 'CN=Ciaran Gultnieks,...' and block_file META-INF/*.RSA; (b) the same URL via /api/fingerprint/from-url returns IDENTICAL sha1/sha256 — proves passthrough + follow_redirects works; (c) URL passthrough: httpbin.org/status/404 error message contains the ORIGINAL 'httpbin.org/status/404' string and does NOT contain 'api.expo.dev/v2' — proves no rewrite; (d) expo.dev/artifacts/eas/deadbeef... error preserves 'expo.dev' substring; (e) unit-tested download_artifact via monkeypatched httpx.AsyncClient: with EXPO_TOKEN unset → no Authorization header (even for expo.dev), with EXPO_TOKEN set → Bearer header sent ONLY when 'expo.dev' in URL (f-droid.org call with token set gets NO Authorization header), gs:// URL raises ValueError, follow_redirects=True verified in AsyncClient init kwargs. Regressions: from-upload of plain text → 400 'Not a valid APK/AAB archive'; from-upload of PKCS7-less zip → 400 'No PKCS#7 signature block'; /api/fingerprint/lookup unchanged; /api/health still ok:true redash_configured:true deployer_configured:true. EXPO_TOKEN header logic was covered by monkeypatch (safer than mutating .env).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/fingerprint/from-url", "issue": "Pre-existing test test_backend.py::test_fingerprint_from_url_bad_archive is flaky — depends on httpbin.org/bytes/1024 which currently returns 503. The endpoint itself is correct: it faithfully surfaces the upstream error (proving passthrough). Consider replacing that URL with a stable in-repo fixture or the same non-archive check via from-upload."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_fingerprint_bugfix.py",
+    "/app/test_reports/pytest/pytest_bugfix.xml"
+  ],
+  "action_items": [
+    "OPTIONAL: swap httpbin.org/bytes/1024 in test_backend.py::test_fingerprint_from_url_bad_archive for a more stable fixture (or drop it — the same case is covered indirectly by from-upload plain-text/zip-no-pkcs7 tests in test_fingerprint_bugfix.py)."
+  ],
+  "critical_code_review_comments": [
+    "signing.download_artifact: httpx client timeout=180 is a wall-clock total; for large artifacts on slow links you may want httpx.Timeout(connect=10, read=180, write=30, pool=10). Not blocking.",
+    "signing.download_artifact writes r.content (whole body in memory). Fine for typical APK/AAB sizes (<200MB) but a streamed .aiter_bytes()/write loop would be safer if giant bundles ever appear.",
+    "The 'only send Bearer when expo.dev in url' check uses substring 'expo.dev' — this also matches subdomains like api.expo.dev and any (redirect) expo.dev host, which is the desired behavior. Confirmed correct.",
+    "server.py fingerprint_from_url wraps Exception broadly; consider surfacing httpx.HTTPStatusError.response.status_code separately (e.g. return HTTPException(400, {'upstream_status': 404, 'url': body.url, 'msg': ...})) so the UI can distinguish auth failures from bad-archive failures. Not blocking."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_fingerprint_bugfix.py (new)",
+    "/app/test_reports/pytest/pytest_bugfix.xml (generated)"
+  ],
+  "success_rate": {"backend": "100% (11/11 bug-fix tests); 97.4% overall (38/39, 1 flaky third-party)", "frontend": "n/a (skipped per request)"},
+  "test_credentials": "none required",
+  "seed_data_creation": "Downloaded F-Droid.apk (~12MB v1-signed) to /tmp/fdroid.apk from https://f-droid.org/F-Droid.apk. Used JOB=41b30fe6-9d40-4818-b76f-df7bac4858e7 for the regression lookup check.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Bug fix fully verified. The header-behaviour tests are unit tests (monkeypatch httpx.AsyncClient) so they run without touching /app/backend/.env — EXPO_TOKEN in .env remains '' (unchanged) as instructed. The F-Droid apk is a great real-world v1-signed fixture: expected sha1 begins with '43:9E:...' and subject is 'CN=Ciaran Gultnieks,...'. If you re-run and /tmp/fdroid.apk is missing, re-download with: curl -Lo /tmp/fdroid.apk https://f-droid.org/F-Droid.apk. If httpbin.org is still down, /api/fingerprint/from-url 404 passthrough check still works via any known-404 endpoint (e.g. https://f-droid.org/does-not-exist-xyz).",
+  "rca_of_the_issue": "Original bug: signing.fingerprints_from_url did a plain httpx.get(url, follow_redirects=True) with no auth header. expo.dev artifact links 302 to https://api.expo.dev/v2/artifacts/eas/<id> which returns 401/400 for unauthenticated callers, leaking as 'HTTP 400 Bad Request for url https://api.expo.dev/v2/…'. Fix: introduce signing.download_artifact(url, dest) that (1) keeps the URL byte-identical (no rewrites/host swaps), (2) sets follow_redirects=True with a 180s timeout, (3) attaches Authorization: Bearer $EXPO_TOKEN ONLY when EXPO_TOKEN env var is set AND 'expo.dev' is in the URL, (4) rejects gs:// with a clear ValueError. fingerprints_from_url now downloads via tempfile through download_artifact and delegates to the unchanged fingerprints_from_bytes (zipfile + pkcs7.load_der_pkcs7_certificates). Verified: (i) URL preserved (grep-test proves 'api.expo.dev/v2' never appears in an error we generated ourselves), (ii) extraction engine works end-to-end (from-upload+from-url on F-Droid apk yield IDENTICAL sha1/sha256), (iii) header wiring correct via monkeypatch (bearer only for expo.dev+token, absent otherwise)."
+}
