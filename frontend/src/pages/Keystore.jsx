@@ -1,5 +1,6 @@
 import React from "react";
 import { useApp } from "@/context/AppContext";
+import { useAuth } from "@/context/AuthContext";
 import PageHeader from "@/components/PageHeader";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -8,10 +9,12 @@ import ResponseDrawer from "@/components/ResponseDrawer";
 import StatusChip from "@/components/StatusChip";
 import { safeCall, api } from "@/api";
 import { toast } from "sonner";
-import { Loader2, KeyRound, Upload, Fingerprint } from "lucide-react";
+import { Loader2, KeyRound, Upload, Fingerprint, Download } from "lucide-react";
 
 export default function Keystore() {
-  const { jobId, operator } = useApp();
+  const { jobId } = useApp();
+  const { user } = useAuth();
+  const operator = user?.email || "";
   const [job, setJob] = React.useState(jobId);
   const [userId, setUserId] = React.useState("");
   const [autoResolved, setAutoResolved] = React.useState(false);
@@ -48,6 +51,21 @@ export default function Keystore() {
     setLookupLoading(false);
     setLookup(r);
     if (!r.ok) toast.error(r.error);
+  };
+
+  const pemData = lookup?.data?.body?.pem_data;
+  const pemPkg = lookup?.data?.body?.package_name;
+  const downloadPem = () => {
+    if (!pemData) return;
+    const blob = new Blob([pemData], { type: "application/x-pem-file" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${pemPkg || job || "keystore"}.pem`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   };
 
   const [file, setFile] = React.useState(null);
@@ -143,6 +161,16 @@ export default function Keystore() {
             >
               {lookupLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : "Look up"}
             </Button>
+            {pemData && (
+              <Button
+                variant="outline"
+                onClick={downloadPem}
+                className="ml-2"
+                data-testid="ks-download-pem"
+              >
+                <Download className="h-4 w-4" /> Download .pem
+              </Button>
+            )}
             {lookup && (
               <ResponseDrawer
                 title="Lookup response"

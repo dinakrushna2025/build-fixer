@@ -1,0 +1,40 @@
+{
+  "summary": "Iteration 3 backend testing: exhaustive coverage of the new Emergent Google Auth layer + regression pass. 35/35 tests passed. Verified public/protected router split, /auth/me with unauth/invalid/expired/valid tokens, cookie + Bearer channels on protected routes, /auth/session missing-sid (400) and fake-sid (401 with clean detail, no cookie leak), @emergent.sh allowlist (unit + resolve-time re-check for a squatter session), /auth/logout deletes the user_sessions doc and the next /me returns 401, /diagnose data isolation + sensitive-field masking still intact, fingerprint-from-url (iteration_2 focus) still works. Also confirmed via code inspection that App.js checks the hash synchronously, AuthContext skips /me when session_id fragment is present, and AuthCallback uses useRef guard for StrictMode double-run.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_auth.py",
+    "/app/test_reports/pytest/pytest_auth.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is now 1288 lines — over the 700-line guideline. Recommend splitting routers by domain (diagnose, expo, identity, keystore, creds, pem, mcp, audit) into separate modules while keeping the public_api / protected api split.",
+    "auth.py line 265 uses `auth_mod._extract_token` (underscore-prefixed private helper) from server.py. Consider promoting to a public function `extract_token` since it's used cross-module.",
+    "auth.py:60 — 'Emergent session exchange failed: HTTP <code>' surfaces the upstream status to the client. That's fine for a preview tool but consider redacting to just 'Invalid or expired sign-in' for prod.",
+    "auth.py:88 store_session does an unconditional insert_one — repeated logins for the same user (same session_token from Emergent) would raise a duplicate-key error IF a unique index existed on session_token. Currently no such index exists, so duplicates silently accumulate. Recommend using update_one({session_token}, {$set: {...}}, upsert=True) and adding a unique index.",
+    "No TTL index on user_sessions.expires_at — expired sessions live forever in mongo until manually deleted. Recommend `db.user_sessions.create_index('expires_at', expireAfterSeconds=0)` at startup (expires_at is currently stored as ISO string; would need to be a real Date for TTL to work).",
+    "auth.py:139 — user document lookup uses email as the lookup key when upserting but user_id when reading. If an emergent user ever changed their email through Google, the upsert path would create a duplicate. Low risk given the emergent.sh allowlist.",
+    "server.py:1265 `auth_mod._extract_token` is called on logout, but the endpoint returns ok:true even if no token was present. Consider returning 204 or leaving as-is (idempotent logout is fine).",
+    "CORS is set to allow_origin_regex='https?://.*' — effectively any origin. Fine for a preview/internal tool but tighten before prod."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_auth.py"
+  ],
+  "success_rate": {
+    "backend": "100%",
+    "frontend": "not tested (skipped per request)"
+  },
+  "test_credentials": "Sessions created directly in mongo via pymongo (see _mk_session in test_auth.py). Emails prefixed 'qa.bot@emergent.sh' or 'TEST_'. Cleanup fixture removes them.",
+  "seed_data_creation": "Tests create ephemeral users + user_sessions in mongo with TEST_ prefix and clean up via module-scoped autouse fixture and per-test try/finally blocks.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Auth layer is solid (35/35 green). Public routes: /api/health, /api/, /api/auth/{session,me,logout}. Every other /api/* returns 401 without a valid session (Bearer or cookie). Use pymongo to seed a session for testing: insert into users(user_id, email=<x>@emergent.sh) + user_sessions(user_id, session_token, expires_at ISO string). Domain allowlist is re-checked on EVERY protected call (not just at login), so changing AUTH_ALLOWED_DOMAIN takes effect immediately. Prior test_backend.py (iteration_1) will now fail — all its requests are unauthenticated. Attach a Bearer header from _mk_session before re-running it if a regression pass is needed.",
+  "rca of the issue": "N/A — no bugs found."
+}

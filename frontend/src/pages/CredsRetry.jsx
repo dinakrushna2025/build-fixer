@@ -1,5 +1,6 @@
 import React from "react";
 import { useApp } from "@/context/AppContext";
+import { useAuth } from "@/context/AuthContext";
 import PageHeader from "@/components/PageHeader";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -13,7 +14,9 @@ import { toast } from "sonner";
 import { Loader2, Trash2, RotateCw, Hammer } from "lucide-react";
 
 export default function CredsRetry() {
-  const { jobId, operator } = useApp();
+  const { jobId } = useApp();
+  const { user } = useAuth();
+  const operator = user?.email || "";
   const [job, setJob] = React.useState(jobId);
   React.useEffect(() => setJob(jobId), [jobId]);
 

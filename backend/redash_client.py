@@ -47,12 +47,14 @@ async def _poll_job(client: httpx.AsyncClient, base: str, headers: dict,
 
 
 async def execute(query: str, parameters: dict[str, Any] | None = None,
-                  timeout: float = 45) -> dict:
+                  timeout: float = 45, data_source_id: int | None = None) -> dict:
     """
     Run an ad-hoc SQL query against Redash. Returns:
         { "ok": bool, "rows": [...], "columns": [...], "raw": {...}, "error": str | None }
     """
     url, key, ds = _cfg()
+    if data_source_id is not None:
+        ds = data_source_id
     if not url or not key:
         return {"ok": False, "rows": [], "columns": [], "raw": None,
                 "error": "REDASH_URL / REDASH_API_KEY not configured on backend"}

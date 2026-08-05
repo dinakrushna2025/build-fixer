@@ -6,6 +6,8 @@ Secrets (REDASH_API_KEY, DEPLOYER_URL, MCP tokens, ...) stay server-side.
 """
 from __future__ import annotations
 
+import asyncio
+import httpx
 import io
 import logging
 import os
@@ -15,7 +17,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
@@ -27,6 +29,7 @@ import deployer_client
 import mcp_client
 import signing
 import kms_shell
+import auth as auth_mod
 from audit import AuditLog
 
 ROOT = Path(__file__).parent
@@ -39,7 +42,16 @@ db = client[os.environ["DB_NAME"]]
 audit = AuditLog(db)
 
 app = FastAPI(title="Mobile Build Resolver")
-api = APIRouter(prefix="/api")
+
+# Auth dependency — protects every /api route except health, root, and the auth
+# endpoints themselves.
+current_user = auth_mod.make_current_user_dep(db)
+protected = Depends(current_user)
+
+# Public router = auth endpoints + health + root. No auth required.
+public_api = APIRouter(prefix="/api")
+# Protected router = everything else. Attaches the auth dependency globally.
+api = APIRouter(prefix="/api", dependencies=[protected])
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -89,6 +101,7 @@ class DiagnoseBody(BaseModel):
 class ExpoLookupBody(BaseModel):
     app_id: str | None = None
     job_id: str | None = None
+    expo_id: str | None = None
 
 
 class IdentityIosBody(BaseModel):
@@ -286,17 +299,223 @@ async def diagnose(body: DiagnoseBody):
     }
 
 
+Q_BUILD_FAILURE = """
+SELECT pr.id AS pipeline_run_id, pr.app, pr.type, pr.status AS run_status,
+       pr.cloud_build_id, pr.eas_build_id, pr.created_at,
+       s.name AS step, s.status AS step_status, s.error AS step_error, s.logs AS step_logs
+FROM pipeline_runs pr
+JOIN pipeline_run_steps s ON s.pipeline_run_id = pr.id
+WHERE pr.app = (SELECT name FROM apps WHERE id = \'{{ job }}\')
+  AND s.status = \'failed\'
+ORDER BY pr.created_at DESC NULLS LAST
+LIMIT 10
+""".strip()
+
+
+Q_BUILD_FAILURE_BY_USER = """
+SELECT pr.id AS pipeline_run_id, pr.app, pr.type, pr.status AS run_status,
+       pr.cloud_build_id, pr.eas_build_id, pr.created_at,
+       s.name AS step, s.status AS step_status, s.error AS step_error, s.logs AS step_logs
+FROM pipeline_runs pr
+JOIN pipeline_run_steps s ON s.pipeline_run_id = pr.id
+WHERE pr.user_id = COALESCE(
+        (SELECT user_id FROM android_app_configs WHERE job_id = \'{{ job }}\' LIMIT 1),
+        (SELECT user_id FROM ios_app_configs WHERE job_id = \'{{ job }}\' LIMIT 1))
+  AND pr.type IN (\'android_build\', \'ios_build\')
+  AND s.status = \'failed\'
+ORDER BY pr.created_at DESC NULLS LAST
+LIMIT 10
+""".strip()
+
+
+Q_LATEST_BUILDS_BY_APP = """
+SELECT DISTINCT ON (pr.type) pr.type, pr.status, pr.created_at
+FROM pipeline_runs pr
+WHERE pr.app = '{{ app }}'
+  AND pr.type IN ('android_build', 'ios_build')
+ORDER BY pr.type, pr.created_at DESC NULLS LAST
+""".strip()
+
+
+def _extract_error_lines(logs):
+    """Pull the human-meaningful error lines out of a raw EAS/Gradle log tail,
+    dropping the JSON phase-marker noise. Purely parsed from the real log -- nothing
+    hard-coded."""
+    out = []
+    for ln in (logs or "").split("\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        low = ln.lower()
+        if "error:" not in low and "gradle build failed" not in low and "build failed:" not in low:
+            continue
+        if ln.startswith("[EAS_LOG] {") or '"level"' in ln:
+            continue  # JSON marker line -- skip the noise
+        ln = ln.replace("[EAS_LOG] ", "").strip()
+        if ": error:" in ln:
+            ln = "error:" + ln.split(": error:", 1)[1]
+        if ln not in out:
+            out.append(ln)
+        if len(out) >= 6:
+            break
+    return out
+
+
 @api.post("/diagnose/logs")
 async def diagnose_logs(body: JobBody):
-    """Pull real EAS / Cloud Build failure logs from the deployer MCP."""
-    r_cb = await mcp_client.deployer_tool("fetch_cloudbuild_logs",
-                                          {"identifier": body.job_id})
-    r_pl = await mcp_client.deployer_tool("fetch_pipeline_logs",
-                                          {"identifier": body.job_id})
-    return {"cloudbuild": r_cb, "pipeline": r_pl}
+    """Why did the build fail? Resolve the job's app, then read the real failed-step
+    error + EAS/Gradle log tail straight from Redash pipeline_run_steps (reliable),
+    instead of the flaky deployer MCP (which needed a cloud_build_id and timed out)."""
+    resolved_via = "apps.id"
+    q = await redash_client.execute(Q_BUILD_FAILURE, {"job": body.job_id})
+    rows = q.get("rows", []) or []
+    if not rows:
+        # This job_id is a build-config job whose deployment slug differs from
+        # apps.id (e.g. app "Fyndit" deploys under slug "community-paws"). Resolve
+        # the owner from the config tables and pull their failed mobile builds.
+        resolved_via = "user_id"
+        q = await redash_client.execute(Q_BUILD_FAILURE_BY_USER, {"job": body.job_id})
+        rows = q.get("rows", []) or []
+    if not rows:
+        return {"found": False, "error": q.get("error"),
+                "note": "No failed build steps found for this job "
+                        "(the build succeeded, or no mobile build ran).",
+                "failures": []}
+
+    # Group identical failures and keep ONLY the real "why it failed" signal:
+    # the parsed step error + the meaningful error lines pulled from the live log.
+    groups = {}
+    for r in rows:
+        key = (r.get("type"), r.get("step"), (r.get("step_error") or "").strip())
+        g = groups.get(key)
+        if g is None:
+            g = {
+                "platform": r.get("type"),
+                "step": r.get("step"),
+                "attempts": 0,
+                "last_failed_at": r.get("created_at"),
+                "why": (r.get("step_error") or "").strip() or None,
+                "error_lines": _extract_error_lines(r.get("step_logs") or ""),
+            }
+            groups[key] = g
+        g["attempts"] += 1
+        if not g["error_lines"]:
+            g["error_lines"] = _extract_error_lines(r.get("step_logs") or "")
+
+    reasons = list(groups.values())
+
+    # Option B: report the LATEST build per platform so stale failures are clearly
+    # flagged as resolved history instead of looking like current breakage.
+    app_slug = rows[0].get("app")
+    lb = await redash_client.execute(Q_LATEST_BUILDS_BY_APP, {"app": app_slug})
+    latest = {}
+    for r in (lb.get("rows", []) or []):
+        latest[r.get("type")] = {"status": r.get("status"), "at": r.get("created_at")}
+
+    for g in reasons:
+        info = latest.get(g["platform"]) or {}
+        g["latest_build_status"] = info.get("status")
+        # ISO-8601 UTC strings compare lexicographically
+        g["resolved"] = bool(
+            info.get("status") == "success"
+            and info.get("at") and g.get("last_failed_at")
+            and info["at"] > g["last_failed_at"]
+        )
+
+    # Keep ONLY currently-failing platforms. If a platform's LATEST build
+    # succeeded, its old failures are resolved history -> drop them entirely.
+    current = [g for g in reasons if not g.get("resolved")]
+
+    if not current:
+        # Every platform's latest build succeeded -> show nothing but "success".
+        return {
+            "found": False,
+            "app": app_slug,
+            "status": "success",
+            "note": "Latest build succeeded - no current build failures.",
+            "latest_builds": latest,
+        }
+
+    # strip the internal resolved/latest fields from the reasons we surface
+    for g in current:
+        g.pop("resolved", None)
+        g.pop("latest_build_status", None)
+
+    failing = ", ".join(g["platform"] for g in current)
+    return {
+        "found": True,
+        "app": app_slug,
+        "resolved_via": resolved_via,
+        "status_note": "Current build failure on: " + failing,
+        "latest_builds": latest,
+        "reasons": current,
+    }
 
 
 # --- find expo account ----------------------------------------------------
+
+Q_EXPO_BY_USER = """
+SELECT a.id AS app_id, a.name AS app, a.expo_id, ea.owner AS expo_owner
+FROM apps a
+JOIN expo_accounts ea ON ea.id = a.expo_id
+WHERE a.user_id = COALESCE(
+        (SELECT user_id FROM apps WHERE id = \'{{ job }}\'),
+        (SELECT user_id FROM android_app_configs WHERE job_id = \'{{ job }}\' LIMIT 1),
+        (SELECT user_id FROM ios_app_configs WHERE job_id = \'{{ job }}\' LIMIT 1))
+ORDER BY a.updated_at DESC NULLS LAST
+LIMIT 20
+""".strip()
+
+Q_JOB_IDENTIFIERS = """
+SELECT app_name, package_name AS pkg FROM android_app_configs WHERE job_id = \'{{ job }}\'
+UNION ALL
+SELECT app_name, bundle_id AS pkg FROM ios_app_configs WHERE job_id = \'{{ job }}\'
+""".strip()
+
+
+async def _true_owner_by_project(job_id, prefer_expo_id=None):
+    """Authoritative account resolution. Find which Expo account actually owns the
+    job's EAS project (expo_project_id) using stored robot tokens. Returns a row
+    {app, expo_id, expo_owner, expo_project_id} or None (no build / external)."""
+    pr = await redash_client.execute(Q_EXPO_PROJECT_ID, {"job": job_id})
+    prow = _first(pr.get("rows", []))
+    project_id = prow.get("expo_project_id") if prow else None
+    if not project_id:
+        return None
+
+    def _row(acc, res):
+        eapp = res.get("expo_app") or {}
+        return {"app": eapp.get("slug") or eapp.get("name"),
+                "app_id": None, "expo_id": acc.get("id"),
+                "expo_owner": acc.get("owner"), "expo_project_id": project_id}
+
+    # fast path: the DB-preferred account
+    if prefer_expo_id:
+        tr = await redash_client.execute(Q_EXPO_TOKEN, {"expo_id": prefer_expo_id})
+        trow = _first(tr.get("rows", []))
+        if trow and trow.get("token"):
+            res = await _expo_app_builds(trow["token"], project_id)
+            if res.get("found"):
+                return _row({"id": prefer_expo_id, "owner": trow.get("owner")}, res)
+
+    # probe every stored account
+    allr = await redash_client.execute(
+        "SELECT id, owner, token FROM expo_accounts WHERE token IS NOT NULL")
+    accts = [a for a in (allr.get("rows", []) or [])
+             if a.get("token") and a.get("id") != prefer_expo_id][:80]
+    sem = asyncio.Semaphore(12)
+
+    async def probe(a):
+        async with sem:
+            r = await _expo_app_builds(a["token"], project_id)
+        return (a, r) if r.get("found") else None
+
+    hits = [h for h in await asyncio.gather(*[probe(a) for a in accts]) if h]
+    if hits:
+        a, res = hits[0]
+        return _row(a, res)
+    return None
+
 
 @api.post("/expo/lookup")
 async def expo_lookup(body: ExpoLookupBody):
@@ -310,12 +529,87 @@ async def expo_lookup(body: ExpoLookupBody):
     q = await redash_client.execute(Q_APP_BY_ID, {"app_id": app_id})
     row = _first(q.get("rows", []))
 
+    # Authoritative: if this job actually has a mobile build (an EAS project),
+    # resolve the account that really owns it on Expo -- this overrides any DB
+    # lineage/owner guess so a job_id always maps to its build's true account.
+    if body.job_id:
+        _true = await _true_owner_by_project(
+            body.job_id, prefer_expo_id=(row.get("expo_id") if row else None))
+        if _true:
+            return {"found": True,
+                    "resolved_from": "expo project owner (live)",
+                    "app_id": app_id,
+                    "row": _true,
+                    "empty_expo": False,
+                    "note": "Resolved from the build's actual EAS project on Expo "
+                            "(authoritative -- overrides DB lineage guesses)."}
+
+    # Exact resolution via fork lineage: if this job's own app has no Expo
+    # account, inherit from the NEAREST ancestor (parent/clone) app that does.
+    # This is the account the build actually descends from.
+    if (not row or not row.get("expo_id")) and body.job_id:
+        up = await redash_client.execute(Q_FORKCHAIN_UP, {"job": body.job_id},
+                                         data_source_id=JOBS_DS_ID)
+        anc = [r for r in (up.get("rows", []) or []) if r.get("id")]
+        ids = [r["id"] for r in anc
+               if re.fullmatch(r"[0-9a-fA-F-]{36}", str(r.get("id") or ""))]
+        if ids:
+            inlist = ", ".join("'" + i + "'" for i in ids)
+            aq = await redash_client.execute(
+                "SELECT a.name AS app, a.id AS app_id, a.expo_id, "
+                "ea.owner AS expo_owner FROM apps a "
+                "JOIN expo_accounts ea ON ea.id = a.expo_id "
+                "WHERE a.id IN (" + inlist + ")")
+            got = {r.get("app_id"): r for r in (aq.get("rows", []) or [])}
+            for r in anc:                # nearest ancestor first (depth order)
+                if r["id"] in got:
+                    row = got[r["id"]]
+                    resolved_from = ("apps.id" if r["id"] == app_id
+                                     else "fork lineage (ancestor app)")
+                    break
+
     # Fallback: the id matched no apps row -> resolve the slug via pipeline_runs.
     if not row and body.job_id:
         q2 = await redash_client.execute(Q_APP_VIA_PIPELINE, {"job": body.job_id})
         row = _first(q2.get("rows", []))
         if row:
             resolved_from = "pipeline_runs.deployment_name"
+
+    # Fallback 2: a build-config job whose id is not an apps.id. Resolve via the
+    # job owner's Expo-linked apps. A user may own several -> rank by name match
+    # against the job's app_name / package and also return all candidates.
+    if (not row or not row.get("expo_id")) and body.job_id:
+        uq = await redash_client.execute(Q_EXPO_BY_USER, {"job": body.job_id})
+        cands = uq.get("rows", []) or []
+        if cands:
+            idq = await redash_client.execute(Q_JOB_IDENTIFIERS, {"job": body.job_id})
+            tokens = set()
+            for ir in (idq.get("rows", []) or []):
+                for v in (ir.get("app_name"), ir.get("pkg")):
+                    for t in re.split(r"[^a-z0-9]+", (v or "").lower()):
+                        if len(t) >= 3:
+                            tokens.add(t)
+
+            def _score(nm):
+                nm = (nm or "").lower()
+                return sum(1 for t in tokens if t in nm)
+
+            cands.sort(key=lambda c: _score(c.get("app")), reverse=True)
+            best = None
+            if cands and (len(cands) == 1 or _score(cands[0].get("app")) > 0):
+                best = cands[0]
+            return {
+                "found": True,
+                "resolved_from": "user_id (owner account)",
+                "app_id": app_id,
+                "direct_app": (row.get("app") if row else None),
+                "row": best,
+                "candidates": cands,
+                "note": ("Resolved via the job owner - this user owns multiple "
+                        "Expo-linked apps. 'row' is the best name match; "
+                        "'candidates' lists all, verify which app is the right one."),
+                "empty_expo": bool(best and not best.get("expo_id")),
+            }
 
     if not row:
         return {"found": False,
@@ -332,14 +626,106 @@ async def expo_lookup(body: ExpoLookupBody):
     }
 
 
+Q_EXPO_PROJECT_ID = """
+SELECT expo_project_id FROM android_app_configs
+WHERE job_id = \'{{ job }}\' AND expo_project_id IS NOT NULL
+UNION ALL
+SELECT expo_project_id FROM ios_app_configs
+WHERE job_id = \'{{ job }}\' AND expo_project_id IS NOT NULL
+LIMIT 1
+""".strip()
+
+Q_EXPO_TOKEN = "SELECT owner, token FROM expo_accounts WHERE id = \'{{ expo_id }}\'"
+
+
+async def _expo_app_builds(token, project_id):
+    """Query live Expo (EAS) for a project's builds using the resolved account's
+    own robot token. Returns the app owner + recent builds, or a mismatch note."""
+    q = ("query($id:String!){ app{ byId(appId:$id){ id name slug "
+         "ownerAccount{name} builds(limit:8,offset:0){ id platform status "
+         "createdAt appVersion } } } }")
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(
+                "https://api.expo.dev/graphql",
+                headers={"Authorization": "Bearer " + token,
+                         "Content-Type": "application/json"},
+                json={"query": q, "variables": {"id": project_id}})
+    except httpx.HTTPError as e:
+        return {"found": False, "error": "Expo unreachable: " + str(e)}
+    try:
+        data = r.json()
+    except Exception:
+        return {"found": False, "error": "non-JSON from Expo", "raw": r.text[:400]}
+    if data.get("errors"):
+        return {"found": False, "errors": data["errors"]}
+    app = ((data.get("data") or {}).get("app") or {}).get("byId")
+    if not app:
+        return {"found": False,
+                "note": "The resolved account's token cannot see this EAS project "
+                        "-- the build may live under a different Expo account."}
+    return {"found": True,
+            "expo_app": {"name": app.get("name"), "slug": app.get("slug"),
+                         "owner": (app.get("ownerAccount") or {}).get("name")},
+            "builds": app.get("builds") or []}
+
+
 @api.post("/expo/builds")
 async def expo_builds(body: ExpoLookupBody):
-    """Cross-check via mcp__expo. Requires EXPO_MCP_TOKEN env."""
-    args: dict[str, Any] = {}
-    if body.app_id:
-        args["appId"] = body.app_id
-    r = await mcp_client.expo_tool("build_list", args)
-    return r
+    """Authoritative cross-check. Take the job's EAS project (expo_project_id) and
+    ask Expo who really owns it: first try the DB-resolved account's own token; if
+    that account cannot read it, probe every stored account token to find the true
+    owner. Expo is the source of truth, so this catches a wrong DB resolution."""
+    if not body.job_id:
+        return {"ok": False, "error": "job_id required -- run the lookup first."}
+    pr = await redash_client.execute(Q_EXPO_PROJECT_ID, {"job": body.job_id})
+    prow = _first(pr.get("rows", []))
+    project_id = prow.get("expo_project_id") if prow else None
+    if not project_id:
+        return {"ok": False,
+                "error": "This job's config has no expo_project_id (no EAS project yet)."}
+
+    resolved_owner = None
+    # 1) fast path: the DB-resolved account
+    if body.expo_id:
+        tr = await redash_client.execute(Q_EXPO_TOKEN, {"expo_id": body.expo_id})
+        trow = _first(tr.get("rows", []))
+        if trow and trow.get("token"):
+            resolved_owner = trow.get("owner")
+            res = await _expo_app_builds(trow["token"], project_id)
+            if res.get("found"):
+                res.update({"ok": True, "expo_project_id": project_id, "matched": True,
+                            "note": "Confirmed on Expo: the resolved account owns this "
+                                    "build's EAS project."})
+                return res
+
+    # 2) resolved account did not own it -> find the true owner across all accounts
+    allr = await redash_client.execute(
+        "SELECT id, owner, token FROM expo_accounts WHERE token IS NOT NULL")
+    accts = [a for a in (allr.get("rows", []) or [])
+             if a.get("token") and a.get("id") != body.expo_id][:80]
+    sem = asyncio.Semaphore(12)
+
+    async def probe(a):
+        async with sem:
+            r = await _expo_app_builds(a["token"], project_id)
+        return (a, r) if r.get("found") else None
+
+    hits = [h for h in await asyncio.gather(*[probe(a) for a in accts]) if h]
+    if hits:
+        a, r = hits[0]
+        r.update({"ok": True, "expo_project_id": project_id, "matched": False,
+                  "true_owner": a.get("owner"),
+                  "note": ("MISMATCH: the DB-resolved account ("
+                           + str(resolved_owner) + ") does NOT own this build's EAS "
+                           "project. It actually lives under Expo account '"
+                           + str(a.get("owner")) + "'.")})
+        return r
+
+    return {"ok": True, "found": False, "expo_project_id": project_id,
+            "note": ("No stored Expo account can read this EAS project. It may live "
+                     "under an external/customer Expo account (not one of ours), or "
+                     "resolved account " + str(resolved_owner) + " lacks access.")}
 
 
 # --- fix identity (destructive, X-Internal-User) --------------------------
@@ -665,6 +1051,120 @@ async def force_regen(body: ForceRegenBody):
 
 # --- generic MCP passthrough (advanced) -----------------------------------
 
+JOBS_DS_ID = int(os.environ.get("JOBS_DS_ID", "10"))
+
+Q_FORKCHAIN_UP = """
+WITH RECURSIVE up AS (
+  SELECT id, title, status, parent_job_id, cloned_parent_job_id, created_at, 0 AS depth
+  FROM jobs WHERE id = \'{{ job }}\'
+  UNION ALL
+  SELECT j.id, j.title, j.status, j.parent_job_id, j.cloned_parent_job_id, j.created_at, up.depth + 1
+  FROM jobs j JOIN up ON j.id = COALESCE(up.parent_job_id, up.cloned_parent_job_id)
+  WHERE up.depth < 10
+)
+SELECT id, title, status, parent_job_id, cloned_parent_job_id, created_at, depth
+FROM up ORDER BY depth
+""".strip()
+
+Q_FORKCHAIN_CHILDREN = """
+SELECT id, title, status, parent_job_id, cloned_parent_job_id, created_at
+FROM jobs
+WHERE parent_job_id = \'{{ job }}\' OR cloned_parent_job_id = \'{{ job }}\'
+ORDER BY created_at DESC
+LIMIT 50
+""".strip()
+
+
+@api.post("/forkchain")
+async def forkchain(body: JobBody):
+    """Show a job's fork/clone lineage: its ancestors (parent chain up to the
+    original) and its direct children, so you can see where this session's job
+    is connected. Reads the jobs table (DS10)."""
+    up = await redash_client.execute(Q_FORKCHAIN_UP, {"job": body.job_id},
+                                     data_source_id=JOBS_DS_ID)
+    ch = await redash_client.execute(Q_FORKCHAIN_CHILDREN, {"job": body.job_id},
+                                     data_source_id=JOBS_DS_ID)
+    chain = up.get("rows", []) or []
+    if not chain:
+        return {"found": False,
+                "reason": "job not found in jobs table (check the id)",
+                "job_id": body.job_id, "error": up.get("error")}
+
+    node = chain[0]
+    ancestors = chain[1:]          # nearest parent first, original last
+    children = ch.get("rows", []) or []
+    root = ancestors[-1] if ancestors else node
+
+    if ancestors:
+        summary = ("Forked from '" + str(root.get("title")) + "' ("
+                   + str(root.get("id")) + "). "
+                   + str(len(ancestors)) + " ancestor(s), "
+                   + str(len(children)) + " child(ren).")
+    else:
+        summary = ("Root job - not forked from anything. "
+                   + str(len(children)) + " child(ren).")
+
+    return {
+        "found": True,
+        "job": node,
+        "ancestors": ancestors,
+        "children": children,
+        "root": root,
+        "summary": summary,
+    }
+
+
+SUPRSEND_DS_ID = int(os.environ.get("SUPRSEND_DS_ID", "18"))
+
+Q_OWNER_SLUGS = """
+SELECT title FROM jobs
+WHERE created_by = (SELECT created_by FROM jobs WHERE id = \'{{ job }}\')
+  AND title IS NOT NULL
+""".strip()
+
+
+@api.post("/suprsend")
+async def suprsend_lookup(body: JobBody):
+    """Which of this job owner's app slugs is connected to SuprSend (push relay)?
+    Resolve every slug the owner has (jobs.title, DS10), then look them up in the
+    push_apps / push_apps_suprsend tables (DS18 integration-proxy)."""
+    if not body.job_id:
+        return {"found": False, "error": "job_id required"}
+    sq = await redash_client.execute(Q_OWNER_SLUGS, {"job": body.job_id},
+                                     data_source_id=JOBS_DS_ID)
+    if not sq.get("ok"):
+        return {"found": False, "error": sq.get("error") or "slug query failed"}
+    slugs = [r.get("title") for r in (sq.get("rows", []) or []) if r.get("title")]
+    # keep real slugs only (drop the job's own untitled UUID rows), dedup, cap
+    uniq = [x for x in dict.fromkeys(slugs)
+            if not re.fullmatch(r"[0-9a-fA-F-]{36}", x or "")][:500]
+    if not uniq:
+        return {"found": False, "job_id": body.job_id,
+                "reason": "no named app slugs found for this job's owner."}
+
+    inlist = ", ".join("'" + x.replace("'", "''") + "'" for x in uniq)
+    q = ("SELECT p.app_id, p.provider, s.workspace_slug, s.provisioned_at "
+         "FROM push_apps p "
+         "LEFT JOIN push_apps_suprsend s ON s.push_app_id = p.id "
+         "WHERE p.app_id IN (" + inlist + ")")
+    pr = await redash_client.execute(q, data_source_id=SUPRSEND_DS_ID)
+    if not pr.get("ok"):
+        return {"found": False, "error": pr.get("error") or "push_apps query failed",
+                "slug_count": len(uniq)}
+    rows = pr.get("rows", []) or []
+    connected = [r for r in rows if r.get("workspace_slug")]
+    return {
+        "found": True,
+        "job_id": body.job_id,
+        "slug_count": len(uniq),
+        "push_apps": rows,
+        "suprsend_connected": connected,
+        "note": ((str(len(connected)) + " slug(s) connected to SuprSend.")
+                 if connected else
+                 "None of this owner's slugs are connected to SuprSend."),
+    }
+
+
 @api.post("/mcp/deployer")
 async def mcp_deployer(body: McpToolBody):
     return await mcp_client.deployer_tool(body.tool, body.args)
@@ -684,7 +1184,7 @@ async def audit_recent(limit: int = 100):
 
 # --- health / config -------------------------------------------------------
 
-@api.get("/health")
+@public_api.get("/health")
 async def health():
     return {
         "ok": True,
@@ -693,21 +1193,90 @@ async def health():
         "deployer_mcp_configured": bool(os.environ.get("DEPLOYER_MCP_URL")),
         "expo_mcp_configured": bool(os.environ.get("EXPO_MCP_URL")),
         "expo_mcp_authed": bool(os.environ.get("EXPO_MCP_TOKEN")),
+        "auth_allowed_domain": os.environ.get("AUTH_ALLOWED_DOMAIN", "emergent.sh"),
     }
 
 
-@api.get("/")
+@public_api.get("/")
 async def root():
     return {"service": "mobile-build-resolver", "ok": True}
 
 
+# --- auth -----------------------------------------------------------------
+
+@public_api.post("/auth/session")
+async def auth_session(request: Request, response: Response):
+    """Exchange a one-time session_id (from Emergent Auth) for a persistent session.
+
+    Enforces the @emergent.sh allowlist. Sets an HttpOnly cookie and also returns
+    the session_token so programmatic clients can use Bearer auth.
+    """
+    sid = request.headers.get("X-Session-ID") or ""
+    if not sid:
+        # Fallback: also accept in JSON body for clients that can't set headers
+        try:
+            body = await request.json()
+            sid = body.get("session_id") or ""
+        except Exception:
+            pass
+    if not sid:
+        raise HTTPException(400, "Missing X-Session-ID header")
+
+    data = await auth_mod.exchange_session_id(sid)
+    email = (data.get("email") or "").strip()
+    auth_mod.enforce_domain(email)
+
+    user_id = await auth_mod.create_or_update_user(
+        db,
+        email=email,
+        name=data.get("name") or email,
+        picture=data.get("picture"),
+    )
+    token = data.get("session_token") or ""
+    if not token:
+        raise HTTPException(502, "Emergent Auth returned no session_token")
+    await auth_mod.store_session(db, user_id, token)
+    auth_mod.set_session_cookie(response, token)
+
+    return {
+        "user_id": user_id,
+        "email": email,
+        "name": data.get("name") or email,
+        "picture": data.get("picture"),
+    }
+
+
+@public_api.get("/auth/me")
+async def auth_me(user: auth_mod.User = protected):
+    return {
+        "user_id": user.user_id,
+        "email": user.email,
+        "name": user.name,
+        "picture": user.picture,
+    }
+
+
+@public_api.post("/auth/logout")
+async def auth_logout(
+    response: Response,
+    session_token: str | None = Cookie(default=None),  # noqa: F821
+    authorization: str | None = Header(default=None),  # noqa: F821
+):
+    token = auth_mod._extract_token(session_token, authorization)
+    if token:
+        await auth_mod.delete_session(db, token)
+    auth_mod.clear_session_cookie(response)
+    return {"ok": True}
+
+
 # --- mount ----------------------------------------------------------------
 
+app.include_router(public_api)
 app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_origin_regex=os.environ.get("CORS_ORIGIN_REGEX", "https?://.*"),
     allow_methods=["*"],
     allow_headers=["*"],
 )

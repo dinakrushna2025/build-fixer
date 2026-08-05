@@ -3,9 +3,11 @@ import axios from "axios";
 const BASE = process.env.REACT_APP_BACKEND_URL;
 export const API = `${BASE}/api`;
 
+// REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
 export const api = axios.create({
   baseURL: API,
   timeout: 60_000,
+  withCredentials: true, // send session_token cookie on every request
 });
 
 // Helper: unwrap { status, data, error } for any endpoint call
