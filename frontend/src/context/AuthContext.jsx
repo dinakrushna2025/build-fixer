@@ -4,6 +4,11 @@ import { API } from "@/api";
 
 const AuthCtx = React.createContext(null);
 
+// Module-level guard: survives StrictMode double-invoke. `/me` must fire at most
+// once per full page load, otherwise a late 401 can overwrite the setUser done
+// by AuthCallback and log the operator out immediately after a successful login.
+let checkAuthRan = false;
+
 /**
  * REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH.
  *
@@ -12,9 +17,13 @@ const AuthCtx = React.createContext(null);
  *   loading === false && !user  -> unauthenticated
  *   loading === false && user   -> authenticated
  *
- * Race-condition guard: if the URL fragment contains `session_id=`, the
- * AuthCallback screen handles the exchange. AuthProvider must SKIP the
- * /me check in that case so it doesn't 401 before the cookie is set.
+ * Race-condition guards (both required):
+ *   (1) When the URL fragment contains `session_id=`, skip `/me` — AuthCallback
+ *       handles the exchange and calls setUser directly.
+ *   (2) `sessionStorage['mbr.auth.pending'] === '1'` is set by AuthCallback
+ *       synchronously and cleared on success/failure. Skip `/me` while it's set.
+ *   (3) Module-level `checkAuthRan` prevents the effect from re-firing under
+ *       React 19 StrictMode's double-invoke.
  */
 export const AuthProvider = ({ children }) => {
   const [user, setUser] = React.useState(null);
@@ -32,10 +41,24 @@ export const AuthProvider = ({ children }) => {
   }, []);
 
   React.useEffect(() => {
-    // CRITICAL: if returning from OAuth callback, skip /me — AuthCallback runs.
-    if (typeof window !== "undefined" && window.location.hash?.includes("session_id=")) {
-      setLoading(false);
-      return;
+    if (checkAuthRan) return;
+    checkAuthRan = true;
+
+    if (typeof window !== "undefined") {
+      // CRITICAL: if returning from OAuth callback, skip /me — AuthCallback runs.
+      if (window.location.hash?.includes("session_id=")) {
+        setLoading(false);
+        return;
+      }
+      // CRITICAL: if AuthCallback marked exchange as in-flight, skip /me.
+      try {
+        if (window.sessionStorage?.getItem("mbr.auth.pending") === "1") {
+          setLoading(false);
+          return;
+        }
+      } catch {
+        /* sessionStorage disabled -> fall through to /me */
+      }
     }
     checkAuth();
   }, [checkAuth]);

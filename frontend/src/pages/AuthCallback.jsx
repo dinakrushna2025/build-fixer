@@ -9,29 +9,50 @@ import { Button } from "@/components/ui/button";
 /**
  * REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH.
  *
- * Renders when the URL fragment contains `session_id=`. Exchanges the sid with
- * the backend exactly once (useRef guard for StrictMode), then navigates to /diagnose.
+ * Renders when the URL fragment contains `session_id=`.
+ *
+ * Race conditions handled:
+ *   - `hasProcessed` ref (per instance) guards StrictMode double-invoke.
+ *   - `sessionStorage['mbr.auth.pending']` (module-lifetime) signals to
+ *     AuthProvider that a /me check must be skipped until the exchange
+ *     completes.
+ *   - The hash is NOT stripped until AFTER the exchange resolves; `navigate()`
+ *     replaces the URL on success (or the error screen navigates to /login),
+ *     so a stray remount of AuthProvider still sees `session_id=` in the hash
+ *     and defers to us.
  */
 export default function AuthCallback() {
   const navigate = useNavigate();
   const { setUser } = useAuth();
-  const processed = React.useRef(false);
+  const hasProcessed = React.useRef(false);
   const [error, setError] = React.useState(null);
 
   React.useEffect(() => {
-    if (processed.current) return;
-    processed.current = true;
+    if (hasProcessed.current) return;
+    hasProcessed.current = true;
+
+    // Signal to AuthProvider that a session exchange is in flight. Set
+    // synchronously so a StrictMode remount of AuthProvider observes it.
+    try {
+      window.sessionStorage?.setItem("mbr.auth.pending", "1");
+    } catch {
+      /* sessionStorage disabled — fall back to hash-based guard alone */
+    }
+
+    const clearPending = () => {
+      try {
+        window.sessionStorage?.removeItem("mbr.auth.pending");
+      } catch {
+        /* noop */
+      }
+    };
 
     const hash = window.location.hash || "";
     const m = hash.match(/session_id=([^&]+)/);
     const sid = m ? decodeURIComponent(m[1]) : null;
 
-    // Strip fragment ASAP so a reload doesn't retry the exchange.
-    if (window.history?.replaceState) {
-      window.history.replaceState(null, "", window.location.pathname + window.location.search);
-    }
-
     if (!sid) {
+      clearPending();
       setError("No session_id in the URL. Try signing in again.");
       return;
     }
@@ -47,8 +68,12 @@ export default function AuthCallback() {
           },
         );
         setUser(r.data);
+        clearPending();
+        // navigate() replaces the URL (including the fragment) — no need for
+        // an explicit history.replaceState any more.
         navigate("/diagnose", { replace: true, state: { user: r.data } });
       } catch (e) {
+        clearPending();
         const detail =
           e?.response?.data?.detail || e?.message || "Sign-in failed. Please try again.";
         setError(detail);

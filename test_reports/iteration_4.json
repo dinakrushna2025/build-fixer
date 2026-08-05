@@ -1,0 +1,53 @@
+{
+  "summary": "Iteration 4: verified the frontend race-condition fix (StrictMode double-invoke of AuthProvider re-firing /api/auth/me after AuthCallback set the user). Backend-only regression run (as instructed). Static inspection of AuthContext.jsx + AuthCallback.jsx confirms all three fix elements are present. Backend regression: 35/35 pytest cases passed against the live preview URL.",
+  "static_frontend_fix_verification": {
+    "AuthContext.jsx": {
+      "module_level_guard_line_10": "let checkAuthRan = false;  ✓ present",
+      "useEffect_guard_lines_44_45": "if (checkAuthRan) return; checkAuthRan = true;  ✓ present",
+      "hash_check_line_49": "window.location.hash?.includes('session_id=') → setLoading(false); return  ✓ present",
+      "sessionStorage_check_line_55": "window.sessionStorage?.getItem('mbr.auth.pending') === '1' → setLoading(false); return  ✓ present",
+      "order": "guard → hash check → sessionStorage check → checkAuth(), matches spec"
+    },
+    "AuthCallback.jsx": {
+      "sessionStorage_set_synchronous_line_37": "window.sessionStorage?.setItem('mbr.auth.pending','1') inside useEffect BEFORE async work  ✓",
+      "history_replaceState_removed": "grep 'replaceState' returns only a comment on line 73; no live call  ✓",
+      "clearPending_on_success_line_71": "clearPending() called before navigate('/diagnose', {replace:true})  ✓",
+      "clearPending_on_error_lines_55_and_76": "cleared on both no-sid and exchange-failure paths  ✓",
+      "hasProcessed_useRef_lines_27_31_32": "StrictMode double-invoke guard kept  ✓",
+      "error_card_back_to_signin_line_106": "navigate('/login', {replace:true}) — replaces URL so fragment is gone  ✓"
+    }
+  },
+  "backend_regression": {
+    "test_file": "/app/backend/tests/test_auth.py",
+    "junit": "/app/test_reports/pytest/pytest_iter4_auth.xml",
+    "result": "35 passed in 15.69s",
+    "coverage_recap": [
+      "/api/health public (200, auth_allowed_domain=emergent.sh)",
+      "/api/auth/me: 401 unauth, 401 invalid bearer, 401 expired session, 200 valid bearer, 200 valid cookie, no Set-Cookie on GET, no _id leak",
+      "9 protected routes: 401 without token / non-401 with bearer (diagnose, expo/lookup, identity/ios, keystore, creds/testflight-retry, fingerprint/lookup, pem/force-regen, mcp/deployer, audit)",
+      "/api/auth/session: 400 missing X-Session-ID, 401 fake sid with 'Emergent session exchange failed' AND no Set-Cookie on error",
+      "@emergent.sh allowlist: enforce_domain unit tests (accept case-insensitive, reject non-emergent 403) + integration re-check via /me for squatter@gmail.com → 403",
+      "/api/auth/logout: deletes session doc, subsequent /me returns 401",
+      "/api/diagnose regression with valid bearer: banner.found=true, banner.platform='iOS + Android', resolved_user_id='8a5f8361-7922-4e36-ae0e-083310753430', sensitive fields masked, no _id leak",
+      "/api/fingerprint/from-url + /api/fingerprint/lookup + /api/audit bearer smoke checks"
+    ]
+  },
+  "playwright_race_condition_check": "SKIPPED per instructions — the manual smoke test in the request confirmed only 1 /me call (was 2) and the 'Sign-in blocked' card renders on /diagnose#session_id=fake-race-test. Static inspection covers the three fix elements; behavioural check is optional and adds no signal beyond what the code review already gives.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": ["/app/backend/tests/test_auth.py", "/app/test_reports/pytest/pytest_iter4_auth.xml"],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Fix is clean and minimal: module-level `checkAuthRan` correctly survives StrictMode remounts (module identity is stable inside one browser tab).",
+    "Double guard (hash + sessionStorage) is defensive-in-depth: if navigation racily wipes the hash before AuthProvider observes it, the sessionStorage flag still catches it.",
+    "AuthCallback keeps the fragment intact until navigate() runs, so App.js's synchronous hash check keeps routing to <AuthCallback/> until the exchange resolves — good.",
+    "clearPending() is called on both success and error paths — no stale 'pending' flag can leak into the next login attempt.",
+    "Note (non-blocking): the module-level `checkAuthRan` will NOT reset across a full page reload (which is what we want), but IS reset by a hard navigate() from React Router since React Router does not remount the module. This is fine here because AuthProvider re-runs its own /me only through checkAuth() calls the app explicitly triggers (e.g. after logout you'd need to reload or call checkAuth manually). Current app behavior is consistent with intent."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (35/35)", "frontend": "static-only, 100% of fix elements verified"},
+  "seed_data_creation": "Sessions seeded directly into mongodb via _mk_session() helper (TEST_ prefix); auto-cleaned by module fixture.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "iteration_4 verified the frontend race-condition fix statically and re-ran the iteration_3 backend regression (35/35). test_auth.py is the canonical regression suite — reuse it. Next iteration can extend with Playwright behavioural verification of the race fix if a headed browser is available: hit ${REACT_APP_BACKEND_URL}/diagnose#session_id=fake-race-test, expect exactly one XHR to /api/auth/session (401) and ZERO XHR to /api/auth/me, plus the 'Sign-in blocked' card with data-testid='auth-error'."
+}
