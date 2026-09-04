@@ -10,10 +10,21 @@ import Keystore from "@/pages/Keystore";
 import CredsRetry from "@/pages/CredsRetry";
 import FingerprintPage from "@/pages/Fingerprint";
 import PemKms from "@/pages/PemKms";
+import ForkChain from "@/pages/ForkChain";
+import Domain from "@/pages/Domain";
+import Stripe from "@/pages/Stripe";
+import EnvWake from "@/pages/EnvWake";
+import EnvKick from "@/pages/EnvKick";
+import EnvBump from "@/pages/EnvBump";
+import EnvHitl from "@/pages/EnvHitl";
+import DbManager from "@/pages/DbManager";
+import AccessAdmin from "@/pages/AccessAdmin";
+import Help from "@/pages/Help";
 import Login from "@/pages/Login";
 import AuthCallback from "@/pages/AuthCallback";
 import { Toaster } from "@/components/ui/sonner";
 import { useAuth } from "@/context/AuthContext";
+import { AccessProvider, useAccess } from "@/context/AccessContext";
 import { Loader2 } from "lucide-react";
 
 function Shell() {
@@ -35,12 +46,50 @@ function Shell() {
             <Route path="/creds" element={<CredsRetry />} />
             <Route path="/fingerprint" element={<FingerprintPage />} />
             <Route path="/pem" element={<PemKms />} />
+            <Route path="/forkchain" element={<ForkChain />} />
+            <Route path="/domain" element={<Domain />} />
+            <Route path="/stripe" element={<Stripe />} />
+            <Route path="/env-wake" element={<EnvWake />} />
+            <Route path="/env-kick" element={<EnvKick />} />
+            <Route path="/env-bump" element={<EnvBump />} />
+            <Route path="/env-hitl" element={<EnvHitl />} />
+            <Route path="/dbmgr" element={<DbManager />} />
+            <Route path="/access" element={<AccessAdmin />} />
             <Route path="*" element={<Navigate to="/diagnose" replace />} />
           </Routes>
         </main>
       </div>
     </div>
   );
+}
+
+function Pending({ email }) {
+  const { logout } = useAuth();
+  return (
+    <div className="h-screen w-screen grid place-items-center bg-background text-foreground p-6">
+      <div className="max-w-md text-center space-y-4">
+        <div className="h-14 w-14 rounded-2xl bg-amber-100 grid place-items-center mx-auto"><Loader2 className="h-7 w-7 text-amber-600 animate-spin" /></div>
+        <h1 className="text-xl font-semibold">Access pending approval</h1>
+        <p className="text-sm text-muted-foreground">Your request has been sent to the admins. You will get access to your tools once an admin approves your account{email ? (" (" + email + ")") : ""}.</p>
+        <button onClick={logout} className="text-sm text-primary hover:underline">Sign out</button>
+      </div>
+    </div>
+  );
+}
+
+function Gate() {
+  const { access, loading } = useAccess();
+  if (loading || !access) {
+    return (
+      <div className="h-screen w-screen grid place-items-center bg-background text-muted-foreground">
+        <div className="flex items-center gap-3"><Loader2 className="h-4 w-4 animate-spin" /><span className="text-sm">Checking access…</span></div>
+      </div>
+    );
+  }
+  if (!access.is_admin && access.status !== "approved") {
+    return <Pending email={access.email} />;
+  }
+  return <Shell />;
 }
 
 function App() {
@@ -89,9 +138,25 @@ function App() {
     return <Navigate to="/diagnose" replace />;
   }
 
+  // Standalone docs page (opens in its own tab, no sidebar/topbar).
+  if (location.pathname === "/help") {
+    return (
+      <>
+        <div className="min-h-screen w-screen overflow-y-auto bg-background text-foreground">
+          <div className="max-w-3xl mx-auto px-6 py-8">
+            <Help />
+          </div>
+        </div>
+        <Toaster position="top-right" richColors closeButton />
+      </>
+    );
+  }
+
   return (
     <>
-      <Shell />
+      <AccessProvider>
+        <Gate />
+      </AccessProvider>
       <Toaster position="top-right" richColors closeButton />
     </>
   );

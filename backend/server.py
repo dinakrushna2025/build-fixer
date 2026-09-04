@@ -51,7 +51,42 @@ protected = Depends(current_user)
 # Public router = auth endpoints + health + root. No auth required.
 public_api = APIRouter(prefix="/api")
 # Protected router = everything else. Attaches the auth dependency globally.
-api = APIRouter(prefix="/api", dependencies=[protected])
+# --- per-tab access enforcement (Last Updated: 2026-09-01) ---
+GUARD_ADMIN_EMAILS = {"dinakrushna@emergent.sh", "rishav.k@emergent.sh", "vinish@emergent.sh"}
+
+_TAB_ROUTES = [
+    ("/env/restart", "/env-wake"), ("/env/android-build", "/env-wake"), ("/env/ios-build", "/env-wake"),
+    ("/env/kick", "/env-kick"), ("/env/bump", "/env-bump"), ("/env/hitl", "/env-hitl"),
+    ("/diagnose", "/diagnose"), ("/expo", "/expo"), ("/suprsend", "/expo"),
+    ("/identity", "/identity"), ("/keystore", "/keystore"), ("/creds", "/creds"),
+    ("/fingerprint", "/fingerprint"), ("/pem", "/pem"), ("/forkchain", "/forkchain"),
+    ("/domain", "/domain"), ("/stripe", "/stripe"), ("/dbmgr", "/dbmgr"), ("/dbcopy", "/dbmgr"),
+]
+
+
+def _tab_for_path(path):
+    if path.startswith("/api"):
+        path = path[4:]
+    for prefix, tab in _TAB_ROUTES:
+        if path == prefix or path.startswith(prefix + "/"):
+            return tab
+    return None
+
+
+async def enforce_tab(request: Request, user=Depends(current_user)):
+    tab = _tab_for_path(request.url.path)
+    if tab is None:
+        return
+    email = (getattr(user, "email", "") or "").lower()
+    if email in GUARD_ADMIN_EMAILS:
+        return
+    doc = await db.tool_access.find_one({"_id": email})
+    if doc and doc.get("status") == "approved" and tab in (doc.get("allowed_tabs") or []):
+        return
+    raise HTTPException(status_code=403, detail="You do not have access to this tool. Ask an admin to grant it.")
+
+
+api = APIRouter(prefix="/api", dependencies=[protected, Depends(enforce_tab)])
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -954,6 +989,844 @@ async def expo_rebuild(body: ExpoBuildActionBody):
 
 
 # --- signing fingerprint --------------------------------------------------
+
+@api.post("/token/test")
+async def token_test():
+    """Self-test the service-account token fetch. Never leaks the token."""
+    import token_manager
+    r = await token_manager.get_token()
+    if not r.get("ok"):
+        return {"ok": False, "error": r.get("error")}
+    tok = r.get("access_token") or ""
+    return {"ok": True, "cached": r.get("cached"),
+            "expires_at": r.get("expires_at"),
+            "token_preview": (tok[:12] + "...") if tok else None}
+
+
+# --- L2 env actions (agent-service, via self-fetched token) ----------------
+
+class EnvActionBody(BaseModel):
+    job_id: str | None = None
+    env_key: str | None = None
+    operator: str | None = None
+    build_type: str | None = "both"
+    machine_type: str | None = "large"
+    model: str | None = None
+
+
+@api.post("/env/restart")
+async def env_restart(body: EnvActionBody):
+    """Wake / force-restart a preview environment (recreates the container)."""
+    import token_manager
+    r = await token_manager.agent_call(
+        "POST", f"/jobs/v0/{body.job_id}/restart-environment?upgrade=false&source=l2_tool")
+    await audit.log(operator=body.operator or "", action="env_restart",
+                    job_id=body.job_id, status_code=r.get("status_code"))
+    return r
+
+
+@api.post("/env/android-build")
+async def env_android_build(body: EnvActionBody):
+    """Trigger a fresh Android (EAS) build via agent-service. No EXPO_MCP_TOKEN needed."""
+    import token_manager
+    r = await token_manager.agent_call(
+        "POST", f"/jobs/v0/android/build/{body.job_id}",
+        {"build_type": body.build_type or "both"})
+    await audit.log(operator=body.operator or "", action="env_android_build",
+                    job_id=body.job_id, status_code=r.get("status_code"),
+                    details={"build_type": body.build_type or "both"})
+    return r
+
+
+@api.post("/env/ios-build")
+async def env_ios_build(body: EnvActionBody):
+    """Trigger a fresh iOS (EAS) build via agent-service."""
+    import token_manager
+    r = await token_manager.agent_call("POST", f"/jobs/v0/ios/build/{body.job_id}", {})
+    await audit.log(operator=body.operator or "", action="env_ios_build",
+                    job_id=body.job_id, status_code=r.get("status_code"))
+    return r
+
+
+@api.post("/env/kick")
+async def env_kick(body: EnvActionBody):
+    """KICK: pod up but hung/zombie -> restart supervisord inside it (envcore proxy)."""
+    ek = body.env_key or body.job_id
+    if not ek:
+        raise HTTPException(400, "env_key (slug) required")
+    url = ("http://envcore.int-worker.emergentagent.com/api/v1/env/proxy/tools/mcp"
+           f"?env_key={ek}&port=8010")
+    payload = {"method": "tools/call", "params": {"name": "execute_bash",
+               "arguments": {"command": "sudo supervisorctl restart all", "timeout": 120, "cwd": None}}}
+    try:
+        async with httpx.AsyncClient(timeout=140) as c:
+            r = await c.request("POST", url, json=payload)
+        b = r.json() if "json" in r.headers.get("content-type", "") else r.text[:600]
+        res = {"ok": r.status_code < 400, "status_code": r.status_code, "body": b}
+    except Exception as e:
+        res = {"ok": False, "status_code": 0, "error": str(e)}
+    await audit.log(operator=body.operator or "", action="env_kick", job_id=ek,
+                    status_code=res.get("status_code"))
+    return res
+
+
+@api.post("/env/bump")
+async def env_bump(body: EnvActionBody):
+    """BUMP: heavy/OOM job -> raise machine type to large (then Wake to apply)."""
+    if not body.job_id:
+        raise HTTPException(400, "job_id required")
+    mt = body.machine_type or "large"
+    try:
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.request("POST", "https://ea.int.apis.emergentagent.com/support/machine-type/increase",
+                                json={"entity_id": body.job_id, "machine_type": mt})
+        b = r.json() if "json" in r.headers.get("content-type", "") else r.text[:400]
+        res = {"ok": r.status_code < 400, "status_code": r.status_code, "body": b}
+    except Exception as e:
+        res = {"ok": False, "status_code": 0, "error": str(e)}
+    await audit.log(operator=body.operator or "", action="env_bump", job_id=body.job_id,
+                    status_code=res.get("status_code"), details={"machine_type": mt})
+    res["note"] = "If bumped, run Wake / Restart to apply the new size."
+    return res
+
+
+@api.post("/env/pause")
+async def env_pause(body: EnvActionBody):
+    """PAUSE: pause a stuck running env (public edge, token) before Wake."""
+    if not body.job_id:
+        raise HTTPException(400, "job_id required")
+    import token_manager
+    r = await token_manager.agent_call("POST", f"/jobs/v0/{body.job_id}/pause-environment")
+    await audit.log(operator=body.operator or "", action="env_pause", job_id=body.job_id,
+                    status_code=r.get("status_code"))
+    return r
+
+
+@api.post("/env/hitl")
+async def env_hitl(body: EnvActionBody):
+    """HITL continue: unstick a hung/paused agent. NOT for poisoned-trajectory wedges."""
+    if not body.job_id:
+        raise HTTPException(400, "job_id required")
+    uid = None
+    try:
+        q = await redash_client.execute(
+            "SELECT created_by FROM jobs WHERE id = '{{ job }}'",
+            {"job": body.job_id}, data_source_id=JOBS_DS_ID)
+        row = _first(q.get("rows", []))
+        uid = row.get("created_by") if row else None
+    except Exception:
+        pass
+    if not uid:
+        return {"ok": False, "status_code": 0,
+                "error": "could not resolve user_id for this job (needed for HITL)"}
+    model = body.model or "claude-sonnet-4-5"
+    import datetime as _d
+    _n = _d.datetime.now(_d.timezone.utc)
+    ts = _n.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_n.microsecond // 1000:03d}Z"
+    payload = {"client_ref_id": body.job_id,
+               "payload": {"processor_type": "env_only", "is_cloud": True, "env_image": "",
+                           "branch": "", "repository": "", "task": "continue", "prompt_name": "",
+                           "prompt_version": "latest", "work_space_dir": "", "model_name": model,
+                           "base64_image_list": [], "human_timestamp": ts, "is_pro_user": True,
+                           "thinking_level": "thinking", "user_id": uid},
+               "model_name": model, "resume": True, "id": body.job_id}
+    import token_manager
+    r = await token_manager.agent_call("POST", "/jobs/v0/hitl-queue/", payload)
+    await audit.log(operator=body.operator or "", action="env_hitl", job_id=body.job_id,
+                    status_code=r.get("status_code"), details={"model": model, "user_id": uid})
+    return {**r, "resolved_user_id": uid, "model": model}
+
+
+class DomainBody(BaseModel):
+    user_id: str | None = None
+    domain: str | None = None
+    operator: str | None = None
+
+
+@api.post("/domain/dns")
+async def domain_dns(body: DomainBody):
+    """Domain-only check: what IP / CNAME does this domain currently point to, and does it look Emergent-connected? Pure DNS, no auth."""
+    import socket
+    d = (body.domain or "").strip().rstrip(".")
+    if not d:
+        raise HTTPException(400, "domain required")
+    out = {"domain": d, "a_records": [], "canonical": None, "aliases": [], "connected": False, "target": None, "error": None}
+    try:
+        infos = socket.getaddrinfo(d, None)
+        out["a_records"] = sorted({i[4][0] for i in infos})
+    except Exception as e:
+        out["error"] = str(e)
+    try:
+        name, aliases, addrs = socket.gethostbyname_ex(d)
+        out["canonical"] = name if name and name != d else None
+        out["aliases"] = aliases or []
+    except Exception:
+        pass
+    blob = (" ".join([out.get("canonical") or ""] + (out.get("aliases") or []))).lower()
+    emergent = ("emergent" in blob) or ("emergentagent" in blob) or ("emergent.host" in blob)
+    out["target"] = out.get("canonical") or (out["a_records"][0] if out["a_records"] else None)
+    out["connected"] = bool(out["a_records"])  # resolves = pointing somewhere
+    out["emergent_target"] = emergent
+    try:
+        sq = await redash_client.execute(
+            "SELECT user_id, verified, deleted, provider, cf_ssl_status, cf_custom_hostname_id "
+            "FROM domains WHERE domain_name = '{{ d }}' ORDER BY created_at DESC LIMIT 1",
+            {"d": d}, data_source_id=5)
+        out["system"] = _first(sq.get("rows", []))
+    except Exception:
+        out["system"] = None
+    return out
+
+
+@api.post("/domain/list")
+async def domain_list(body: DomainBody):
+    """List all custom domains owned by user_id (X-User-ID scoped)."""
+    if not body.user_id:
+        raise HTTPException(400, "user_id required")
+    return await deployer_client.domains_list(body.user_id)
+
+
+@api.post("/domain/remove")
+async def domain_remove(body: DomainBody):
+    """Remove a stale/orphan custom domain so the user can re-add it elsewhere."""
+    if not body.domain:
+        raise HTTPException(400, "domain required")
+    uid = body.user_id
+    if not uid:
+        q = await redash_client.execute(
+            "SELECT user_id FROM domains WHERE domain_name = '{{ d }}' ORDER BY created_at DESC LIMIT 1",
+            {"d": body.domain}, data_source_id=5)
+        row = _first(q.get("rows", []))
+        uid = row.get("user_id") if row else None
+    if not uid:
+        return {"ok": False, "status_code": 0,
+                "error": "could not resolve owner for this domain (not in domains table / redash)"}
+    r = await deployer_client.domain_delete(body.domain, uid)
+    await audit.log(operator=body.operator or "", action="domain_remove",
+                    job_id=body.domain, status_code=r.get("status_code"),
+                    details={"user_id": uid, "domain": body.domain})
+    return {**r, "resolved_user_id": uid}
+
+
+STRIPE_BASE = "https://integrations.emergentagent.com"
+
+
+async def _emergent_key_for_job(job_id: str):
+    """job -> owner user_id (DS10) -> customer universal key (DS18 emergent_keys)."""
+    q1 = await redash_client.execute(
+        "SELECT created_by FROM jobs WHERE id = '{{ j }}'", {"j": job_id}, data_source_id=JOBS_DS_ID)
+    row = _first(q1.get("rows", []))
+    uid = row.get("created_by") if row else None
+    if not uid:
+        return None, None
+    q2 = await redash_client.execute(
+        "SELECT emergent_key FROM emergent_keys WHERE user_id = '{{ u }}' ORDER BY updated_at DESC LIMIT 1",
+        {"u": uid}, data_source_id=18)
+    r2 = _first(q2.get("rows", []))
+    return uid, (r2.get("emergent_key") if r2 else None)
+
+
+class StripeBody(BaseModel):
+    job_id: str
+    operator: str | None = None
+
+
+@api.post("/stripe/state")
+async def stripe_state(body: StripeBody):
+    """Read the Stripe sandbox state for a job (customer key scoped)."""
+    uid, key = await _emergent_key_for_job(body.job_id)
+    if not key:
+        return {"ok": False, "status_code": 0, "error": "could not resolve emergent_key for job owner"}
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.get(f"{STRIPE_BASE}/stripe/jobs/{body.job_id}/sandbox",
+                        headers={"Authorization": "Bearer " + key})
+    b = r.json() if "json" in r.headers.get("content-type", "") else r.text[:500]
+    return {"ok": r.status_code < 400, "status_code": r.status_code, "body": b, "user_id": uid}
+
+
+@api.post("/stripe/unlink")
+async def stripe_unlink(body: StripeBody):
+    """Unlink (remove) the Stripe sandbox for a job, then re-check state."""
+    uid, key = await _emergent_key_for_job(body.job_id)
+    if not key:
+        return {"ok": False, "status_code": 0, "error": "could not resolve emergent_key for job owner"}
+    async with httpx.AsyncClient(timeout=30) as c:
+        d = await c.request("DELETE", f"{STRIPE_BASE}/stripe/jobs/{body.job_id}/sandbox",
+                            headers={"Authorization": "Bearer " + key})
+        v = await c.get(f"{STRIPE_BASE}/stripe/jobs/{body.job_id}/sandbox",
+                        headers={"Authorization": "Bearer " + key})
+    db = d.json() if "json" in d.headers.get("content-type", "") else d.text[:400]
+    vb = v.json() if "json" in v.headers.get("content-type", "") else v.text[:400]
+    await audit.log(operator=body.operator or "", action="stripe_unlink", job_id=body.job_id,
+                    status_code=d.status_code, details={"user_id": uid})
+    return {"ok": d.status_code < 400, "status_code": d.status_code, "delete_body": db,
+            "verify_status": v.status_code, "verify_body": vb}
+
+
+# --- DB bulk copy: preview -> production (Last Updated: 2026-08-26) --------
+
+ENVCORE_PROXY = "http://envcore.int-worker.emergentagent.com/api/v1/env/proxy/tools/mcp"
+
+
+async def _dbcopy_targets(job_id: str):
+    """Resolve job_id -> app robustly (direct apps.id, then jobs parent/clone, then user latest)."""
+    async def app_row(sql, params):
+        r = await redash_client.execute(sql, params, data_source_id=5)
+        return _first(r.get("rows", []))
+
+    Q = "SELECT name, user_id, status FROM apps WHERE id = '{{ j }}'"
+    resolved_via = "apps.id"
+    ar = await app_row(Q, {"j": job_id})
+    uid = None
+    if not ar:
+        jr = _first((await redash_client.execute(
+            "SELECT created_by, parent_job_id, cloned_parent_job_id FROM jobs WHERE id = '{{ j }}'",
+            {"j": job_id}, data_source_id=10)).get("rows", []))
+        if jr:
+            uid = jr.get("created_by")
+            for key in ("parent_job_id", "cloned_parent_job_id"):
+                pid = jr.get(key)
+                if pid and not ar:
+                    ar = await app_row(Q, {"j": pid})
+                    if ar:
+                        resolved_via = "jobs." + key
+            if not ar and uid:
+                ar = await app_row(
+                    "SELECT name, user_id, status FROM apps WHERE user_id = '{{ u }}' "
+                    "ORDER BY (status = 'deleted') ASC, updated_at DESC LIMIT 1", {"u": uid})
+                if ar:
+                    resolved_via = "user.latest_app"
+    if not ar:
+        return None
+    slug = ar.get("name"); uid = ar.get("user_id") or uid; status = ar.get("status")
+    murl = dbn = None
+    sec = await redash_client.execute(
+        "SELECT name, value FROM secrets WHERE app_id = '{{ a }}' AND name IN ('MONGO_URL','DB_NAME') "
+        "ORDER BY version DESC", {"a": slug}, data_source_id=5)
+    for row in (sec.get("rows", []) or []):
+        if row.get("name") == "MONGO_URL" and not murl:
+            murl = row.get("value")
+        elif row.get("name") == "DB_NAME" and not dbn:
+            dbn = row.get("value")
+    return {"slug": slug, "user_id": uid, "prod_url": murl, "prod_db": dbn,
+            "resolved_via": resolved_via, "app_status": status}
+
+
+def _parse_pod_stdout(text: str) -> str:
+    import json as _j
+    inner = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = _j.loads(line)
+        except Exception:
+            continue
+        res = obj.get("result") if isinstance(obj, dict) else None
+        if isinstance(res, dict):
+            cont = res.get("content")
+            if isinstance(cont, list) and cont and isinstance(cont[0], dict):
+                t = cont[0].get("text")
+                if t is not None:
+                    inner = t
+    if inner is None:
+        return text[:2000]
+    try:
+        w = _j.loads(inner)
+        if isinstance(w, dict) and "stdout" in w:
+            return w.get("stdout") or ""
+    except Exception:
+        pass
+    return inner
+
+
+async def _pod_exec(slug: str, command: str, timeout: float = 240) -> str:
+    C = {"Content-Type": "application/json",
+         "Accept": "application/json, text/event-stream"}
+    url = f"{ENVCORE_PROXY}?env_key={slug}&port=8010"
+    async with httpx.AsyncClient(timeout=timeout) as c:
+        init = await c.post(url, headers=C, json={"jsonrpc": "2.0", "id": 0,
+            "method": "initialize", "params": {"protocolVersion": "2024-11-05",
+            "capabilities": {}, "clientInfo": {"name": "mbr", "version": "1"}}})
+        sid = init.headers.get("mcp-session-id")
+        H = dict(C)
+        if sid:
+            H["mcp-session-id"] = sid
+        r = await c.post(url, headers=H, json={"jsonrpc": "2.0", "id": 2,
+            "method": "tools/call", "params": {"name": "execute_bash",
+            "arguments": {"command": command, "timeout": int(timeout) - 20}}})
+    return _parse_pod_stdout(r.text)
+
+
+def _copy_script(prod_url: str, prod_db: str, only, mode: str, dry: bool, app_status=None) -> str:
+    import base64 as _b64, json as _j
+    cfg = {"prod_url": prod_url, "prod_db": prod_db, "only": only, "mode": mode, "dry": dry, "app_status": app_status}
+    L = []
+    L.append("import os, json")
+    L.append("from pymongo import MongoClient, ReplaceOne")
+    L.append("CFG = json.loads(%r)" % _j.dumps(cfg))
+    L.append("src = MongoClient('mongodb://localhost:27017', serverSelectionTimeoutMS=8000)")
+    L.append("names = [n for n in src.list_database_names() if n not in ('admin','config','local')]")
+    L.append("pdb = os.environ.get('DB_NAME')")
+    L.append("prev = pdb if pdb in names else (names[0] if names else None)")
+    L.append("if not prev:")
+    L.append("    print(json.dumps({'ok': False, 'error': 'no preview database found'})); raise SystemExit")
+    L.append("sdb = src[prev]")
+    L.append("out = {'ok': True, 'preview_db': prev, 'prod_db': CFG['prod_db'], 'mode': CFG['mode'], 'dry': CFG['dry'], 'collections': {}}")
+    L.append("try:")
+    L.append("    dst = MongoClient(CFG['prod_url'], serverSelectionTimeoutMS=12000)")
+    L.append("    ddb = dst[CFG['prod_db']]")
+    L.append("    dst.admin.command('ping')")
+    L.append("except Exception as e:")
+    L.append("    host = CFG['prod_url'].split('@')[-1].split('/')[0].split('?')[0]")
+    L.append("    msg = 'prod cluster unreachable (TCP timeout / paused / not allowlisted): ' + str(e)[:140]")
+    L.append("    if CFG.get('app_status') == 'deleted': msg += ' | NOTE: app is deleted, so this MONGO_URL is likely a stale/paused cluster.'")
+    L.append("    print(json.dumps({'ok': False, 'error': msg, 'preview_db': prev, 'prod_host': host})); raise SystemExit")
+    L.append("colls = [CFG['only']] if CFG['only'] else sdb.list_collection_names()")
+    L.append("for c in colls:")
+    L.append("    sc = sdb[c].count_documents({})")
+    L.append("    if CFG['dry']:")
+    L.append("        out['collections'][c] = {'src_count': sc, 'prod_count': ddb[c].count_documents({})}")
+    L.append("        continue")
+    L.append("    if CFG['mode'] == 'replace':")
+    L.append("        ddb.drop_collection(c)")
+    L.append("    copied = 0")
+    L.append("    docs = list(sdb[c].find({}))")
+    L.append("    if docs:")
+    L.append("        ops = [ReplaceOne({'_id': d['_id']}, d, upsert=True) for d in docs]")
+    L.append("        for i in range(0, len(ops), 1000):")
+    L.append("            ddb[c].bulk_write(ops[i:i+1000], ordered=False)")
+    L.append("        copied = len(docs)")
+    L.append("    out['collections'][c] = {'copied': copied, 'prod_count_after': ddb[c].count_documents({})}")
+    L.append("print(json.dumps(out))")
+    L.append("src.close(); dst.close()")
+    srcpy = chr(10).join(L)
+    b = _b64.b64encode(srcpy.encode()).decode()
+    return "echo " + b + " | base64 -d | python3 -"
+
+
+async def _dbcopy(job_id: str, only, mode: str, dry: bool):
+    tg = await _dbcopy_targets(job_id)
+    if not tg:
+        jr = _first((await redash_client.execute(
+            "SELECT title, status FROM jobs WHERE id = '{{ j }}'", {"j": job_id},
+            data_source_id=10)).get("rows", []))
+        if jr:
+            return {"ok": False, "error": "job '" + str(jr.get("title")) + "' is " +
+                    str(jr.get("status")) + " and has no deployed app yet (never deployed to "
+                    "production). DB Copy needs a deployed app with a prod database."}
+        return {"ok": False, "error": "job id not found in jobs (DS10) or apps (DS5) - check the id."}
+    if not tg.get("prod_url") or not tg.get("prod_db"):
+        return {"ok": False, "error": "prod MONGO_URL/DB_NAME not found in secrets (app not deployed?)",
+                "slug": tg.get("slug"), "resolved_via": tg.get("resolved_via"), "app_status": tg.get("app_status")}
+    cmd = _copy_script(tg["prod_url"], tg["prod_db"], only, mode, dry, tg.get("app_status"))
+    raw = await _pod_exec(tg["slug"], cmd)
+    import json as _j
+    parsed = None
+    for line in raw.splitlines()[::-1]:
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                parsed = _j.loads(line); break
+            except Exception:
+                pass
+    if parsed is None:
+        return {"ok": False, "error": "could not parse pod output", "slug": tg["slug"], "raw": raw[:800]}
+    parsed["slug"] = tg["slug"]
+    parsed["resolved_via"] = tg.get("resolved_via")
+    parsed["app_status"] = tg.get("app_status")
+    return parsed
+
+
+class DbCopyBody(BaseModel):
+    job_id: str
+    collection: str | None = None
+    mode: str | None = "upsert"
+    operator: str | None = None
+
+
+# --- DB Manager: mongo-viewer-2 proxy (Last Updated: 2026-08-27) ---
+
+import uuid as _uuid
+MV_BASE = "https://mongo-viewer-2.internal.emergent.host/api"
+_mv_sessions = {}
+
+
+async def _mv_headers():
+    import token_manager
+    tk = await token_manager.get_token()
+    tok = tk.get("access_token") if isinstance(tk, dict) else tk
+    return {"Authorization": "Bearer " + (tok or ""), "Content-Type": "application/json"}
+
+
+async def _mv_connect(slug, prod_url, force=False):
+    key = (slug or "", prod_url or "")
+    if not force and key in _mv_sessions:
+        return _mv_sessions[key], None
+    H = await _mv_headers()
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.post(MV_BASE + "/connect", headers=H,
+                         json={"preview_app_name": slug, "production_url": prod_url or ""})
+    if r.status_code != 200:
+        return None, {"status": r.status_code, "text": r.text[:300]}
+    j = r.json()
+    _mv_sessions[key] = j.get("session_id")
+    return j.get("session_id"), j
+
+
+async def _mv_req(method, slug, prod_url, path, json_body=None):
+    sid, info = await _mv_connect(slug, prod_url)
+    if not sid:
+        return {"ok": False, "error": "mongo-viewer connect failed", "detail": info}
+    for attempt in (0, 1):
+        H = await _mv_headers(); H["X-Session-ID"] = sid
+        async with httpx.AsyncClient(timeout=90) as c:
+            r = await c.request(method, MV_BASE + path, headers=H, json=json_body)
+        if r.status_code == 401 and attempt == 0:
+            sid, info = await _mv_connect(slug, prod_url, force=True)
+            if not sid:
+                return {"ok": False, "error": "reconnect failed", "detail": info}
+            continue
+        if r.status_code != 200:
+            return {"ok": False, "error": "HTTP " + str(r.status_code), "detail": r.text[:200]}
+        return {"ok": True, "data": r.json()}
+    return {"ok": False, "error": "unreachable"}
+
+
+class DbMgrBody(BaseModel):
+    slug: str
+    prod_url: str | None = None
+    target: str | None = "preview"
+    db: str | None = None
+    coll: str | None = None
+    page: int | None = 1
+    limit: int | None = 20
+    filter: str | None = None
+    changes: list | None = None
+    documents: list | None = None
+    operator: str | None = None
+
+
+def _mv_env(target):
+    return "production" if (target or "").lower() == "production" else "preview"
+
+
+async def _mv_databases(slug, prod_url, env):
+    r = await _mv_req("GET", slug, prod_url, "/databases/" + env)
+    if not r.get("ok"):
+        return r
+    dbs = [{"name": d.get("name"), "collections": d.get("collection_count", 0)}
+           for d in (r["data"].get("databases") or [])]
+    return {"ok": True, "databases": dbs}
+
+
+@api.post("/dbmgr/connect")
+async def dbmgr_connect(body: DbMgrBody):
+    sid, info = await _mv_connect(body.slug, body.prod_url, force=True)
+    if not sid:
+        return {"ok": False, "error": "mongo-viewer connect failed", "detail": info}
+    conns = (info or {}).get("connections", {})
+    pv = conns.get("preview", {}) or {}
+    pr = conns.get("production", {}) or {}
+    prev = {"connected": pv.get("connected", False), "database_count": pv.get("database_count", 0), "databases": []}
+    prod = {"connected": pr.get("connected", False), "database_count": pr.get("database_count", 0), "databases": [], "error": pr.get("error")}
+    if prev["connected"]:
+        d = await _mv_databases(body.slug, body.prod_url, "preview")
+        if d.get("ok"): prev["databases"] = d["databases"]
+    if body.prod_url and prod["connected"]:
+        d = await _mv_databases(body.slug, body.prod_url, "production")
+        if d.get("ok"): prod["databases"] = d["databases"]
+    return {"ok": True, "slug": body.slug, "preview": prev, "production": (prod if body.prod_url else None)}
+
+
+@api.post("/dbmgr/databases")
+async def dbmgr_databases(body: DbMgrBody):
+    return await _mv_databases(body.slug, body.prod_url, _mv_env(body.target))
+
+
+@api.post("/dbmgr/collections")
+async def dbmgr_collections(body: DbMgrBody):
+    r = await _mv_req("GET", body.slug, body.prod_url, "/collections/" + _mv_env(body.target) + "/" + (body.db or ""))
+    if not r.get("ok"):
+        return r
+    cols = [{"name": c.get("name"), "count": c.get("document_count", 0)}
+            for c in (r["data"].get("collections") or [])]
+    return {"ok": True, "collections": cols}
+
+
+def _norm_filter(f):
+    """Accept raw Mongo JSON, a bare _id/hex, or plain text (regex across common fields)."""
+    import json as _j, re as _re
+    if not f:
+        return None
+    f = f.strip()
+    if not f:
+        return None
+    try:
+        obj = _j.loads(f)
+        if isinstance(obj, dict):
+            return _j.dumps(obj)
+    except Exception:
+        pass
+    if _re.fullmatch(r"[0-9a-fA-F]{24}", f):
+        return _j.dumps({"_id": f})
+    rx = {"$regex": _re.escape(f), "$options": "i"}
+    return _j.dumps({"$or": [{"_id": f}, {"id": rx}, {"name": rx}, {"title": rx}, {"text": rx}, {"email": rx}, {"status": rx}]})
+
+
+@api.post("/dbmgr/documents")
+async def dbmgr_documents(body: DbMgrBody):
+    _lim = body.limit or 20
+    _skip = ((body.page or 1) - 1) * _lim
+    q = "?skip=" + str(_skip) + "&limit=" + str(_lim)
+    nf = _norm_filter(body.filter)
+    if nf:
+        import urllib.parse as _u
+        q += "&filter=" + _u.quote(nf)
+    path = "/documents/" + _mv_env(body.target) + "/" + (body.db or "") + "/" + (body.coll or "") + q
+    r = await _mv_req("GET", body.slug, body.prod_url, path)
+    if not r.get("ok"):
+        return r
+    d = r["data"]
+    return {"ok": True, "documents": d.get("documents", []), "total": d.get("total", 0),
+            "total_pages": d.get("total_pages", 1), "current_page": d.get("current_page", body.page or 1)}
+
+
+@api.post("/dbmgr/apply")
+async def dbmgr_apply(body: DbMgrBody):
+    env = _mv_env(body.target)
+    mv_changes = []
+    for ch in (body.changes or []):
+        op = ch.get("op") or ch.get("type")
+        base = {"id": str(_uuid.uuid4()), "env": env, "db": ch.get("db"), "collection": ch.get("collection")}
+        if op in ("edit", "update"):
+            mv_changes.append({**base, "type": "edit", "docId": ch.get("docId"),
+                               "fieldPath": ch.get("field"), "oldValue": ch.get("oldValue"), "newValue": ch.get("value")})
+        elif op == "delete":
+            mv_changes.append({**base, "type": "delete", "docId": ch.get("docId")})
+        elif op in ("insert", "create"):
+            mv_changes.append({**base, "type": "create", "document": ch.get("document")})
+    r = await _mv_req("POST", body.slug, body.prod_url, "/batch/apply", {"changes": mv_changes})
+    try:
+        await audit.log(operator=body.operator or "", action="dbmgr_apply", job_id=body.slug,
+                        status_code=200 if r.get("ok") else 0,
+                        details={"target": env, "changes": len(mv_changes)})
+    except Exception:
+        pass
+    if not r.get("ok"):
+        return r
+    return {"ok": True, **r["data"]}
+
+
+async def _mv_dump_coll(slug, prod_url, env, db, coll, cap=200000):
+    docs = []
+    skip = 0
+    while True:
+        r = await _mv_req("GET", slug, prod_url,
+                          "/documents/" + env + "/" + db + "/" + coll + "?skip=" + str(skip) + "&limit=500")
+        if not r.get("ok"):
+            return r
+        d = r["data"]
+        batch = d.get("documents", [])
+        docs.extend(batch)
+        if not d.get("has_next") or not batch or len(docs) >= cap:
+            break
+        skip += 500
+    return {"ok": True, "documents": docs}
+
+
+@api.post("/dbmgr/dump")
+async def dbmgr_dump(body: DbMgrBody):
+    env = _mv_env(body.target)
+    if body.coll:
+        r = await _mv_dump_coll(body.slug, body.prod_url, env, body.db, body.coll)
+        if not r.get("ok"):
+            return r
+        return {"ok": True, "target": env, "db": body.db, "coll": body.coll,
+                "count": len(r["documents"]), "documents": r["documents"]}
+    rc = await _mv_req("GET", body.slug, body.prod_url, "/collections/" + env + "/" + (body.db or ""))
+    if not rc.get("ok"):
+        return rc
+    import io as _io, zipfile as _zip, base64 as _b64, json as _json
+    total = 0
+    counts = {}
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w", _zip.ZIP_DEFLATED) as zf:
+        for c in (rc["data"].get("collections") or []):
+            name = c.get("name")
+            r = await _mv_dump_coll(body.slug, body.prod_url, env, body.db, name)
+            docs = r.get("documents", []) if r.get("ok") else []
+            zf.writestr(name + ".json", _json.dumps(docs, indent=2, ensure_ascii=False))
+            counts[name] = len(docs)
+            total += len(docs)
+    zip_b64 = _b64.b64encode(buf.getvalue()).decode()
+    return {"ok": True, "target": env, "db": body.db, "count": total, "counts": counts, "zip_b64": zip_b64}
+
+
+# --- Access control: admin approval + per-user tabs (Last Updated: 2026-08-28) ---
+
+from datetime import datetime as _dt, timezone as _tz
+
+ADMIN_EMAILS = {"dinakrushna@emergent.sh", "rishav.k@emergent.sh", "vinish@emergent.sh"}
+
+ACCESS_TABS = [
+    {"key": "/diagnose", "label": "Diagnose"},
+    {"key": "/expo", "label": "Find Account"},
+    {"key": "/identity", "label": "Fix App Identity"},
+    {"key": "/keystore", "label": "Keystore Manager"},
+    {"key": "/creds", "label": "Creds & Retry (iOS)"},
+    {"key": "/fingerprint", "label": "Signing Fingerprint"},
+    {"key": "/pem", "label": "PEM / KMS Tools"},
+    {"key": "/forkchain", "label": "Fork Chain"},
+    {"key": "/domain", "label": "Domain Remove"},
+    {"key": "/stripe", "label": "Stripe Sandbox"},
+    {"key": "/env-wake", "label": "Wake / Restart"},
+    {"key": "/env-kick", "label": "Kick"},
+    {"key": "/env-bump", "label": "Bump to large"},
+    {"key": "/env-hitl", "label": "HITL continue"},
+    {"key": "/dbmgr", "label": "DB Manager"},
+]
+ALL_TAB_KEYS = [t["key"] for t in ACCESS_TABS]
+
+
+def _is_admin(user):
+    return (getattr(user, "email", "") or "").lower() in ADMIN_EMAILS
+
+
+def _now_iso():
+    return _dt.now(_tz.utc).isoformat()
+
+
+@api.get("/access/me")
+async def access_me(user: auth_mod.User = protected):
+    email = (user.email or "").lower()
+    if _is_admin(user):
+        return {"email": email, "name": user.name, "is_admin": True, "status": "approved",
+                "allowed_tabs": ALL_TAB_KEYS, "tabs": ACCESS_TABS}
+    doc = await db.tool_access.find_one({"_id": email})
+    if not doc:
+        doc = {"_id": email, "email": email, "name": user.name, "picture": user.picture,
+               "status": "pending", "allowed_tabs": [], "created_at": _now_iso(), "updated_at": _now_iso()}
+        try:
+            await db.tool_access.insert_one(doc)
+        except Exception:
+            pass
+    return {"email": email, "name": user.name, "is_admin": False,
+            "status": doc.get("status", "pending"), "allowed_tabs": doc.get("allowed_tabs", []),
+            "tabs": ACCESS_TABS}
+
+
+@api.get("/access/requests")
+async def access_requests(user: auth_mod.User = protected):
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail="admin only")
+    rows = []
+    async for d in db.tool_access.find({}).sort("updated_at", -1):
+        rows.append({"email": d.get("email"), "name": d.get("name"), "picture": d.get("picture"),
+                     "status": d.get("status"), "allowed_tabs": d.get("allowed_tabs", []),
+                     "approved_by": d.get("approved_by"), "updated_at": d.get("updated_at")})
+    return {"ok": True, "admins": sorted(ADMIN_EMAILS), "tabs": ACCESS_TABS, "requests": rows}
+
+
+class AccessDecision(BaseModel):
+    email: str
+    tabs: list | None = None
+    status: str | None = "approved"
+
+
+@api.post("/access/approve")
+async def access_approve(body: AccessDecision, user: auth_mod.User = protected):
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail="admin only")
+    email = (body.email or "").lower()
+    if not email:
+        return {"ok": False, "error": "email required"}
+    tabs = [t for t in (body.tabs or []) if t in ALL_TAB_KEYS]
+    status = body.status if body.status in ("approved", "denied", "pending") else "approved"
+    if status != "approved":
+        tabs = []
+    await db.tool_access.update_one(
+        {"_id": email},
+        {"$set": {"email": email, "status": status, "allowed_tabs": tabs,
+                  "approved_by": (user.email or "").lower(), "updated_at": _now_iso()}},
+        upsert=True)
+    return {"ok": True, "email": email, "status": status, "allowed_tabs": tabs}
+
+
+@api.post("/dbmgr/import")
+async def dbmgr_import(body: DbMgrBody):
+    """Bulk import with de-dupe: skip docs whose _id already exists, insert only new ones."""
+    env = _mv_env(body.target)
+    docs = body.documents or []
+    if not docs:
+        return {"ok": False, "error": "no documents to import"}
+    if not body.db or not body.coll:
+        return {"ok": False, "error": "db and collection required"}
+    existing = set()
+    skip = 0
+    while True:
+        r = await _mv_req("GET", body.slug, body.prod_url,
+                          "/documents/" + env + "/" + body.db + "/" + body.coll + "?skip=" + str(skip) + "&limit=500")
+        if not r.get("ok"):
+            break
+        d = r["data"]
+        batch = d.get("documents", [])
+        for x in batch:
+            if isinstance(x, dict) and x.get("_id") is not None:
+                existing.add(str(x["_id"]))
+        if not d.get("has_next") or not batch:
+            break
+        skip += 500
+    to_insert = []
+    skipped = 0
+    for doc in docs:
+        _id = doc.get("_id") if isinstance(doc, dict) else None
+        if _id is not None and str(_id) in existing:
+            skipped += 1
+            continue
+        to_insert.append(doc)
+    inserted = 0
+    failed = 0
+    for i in range(0, len(to_insert), 100):
+        chunk = to_insert[i:i + 100]
+        changes = [{"id": str(_uuid.uuid4()), "type": "create", "env": env,
+                    "db": body.db, "collection": body.coll, "document": doc} for doc in chunk]
+        rr = await _mv_req("POST", body.slug, body.prod_url, "/batch/apply", {"changes": changes})
+        if rr.get("ok"):
+            summ = (rr["data"] or {}).get("summary") or {}
+            inserted += summ.get("successful", 0)
+            failed += summ.get("failed", 0)
+        else:
+            failed += len(chunk)
+    try:
+        await audit.log(operator=body.operator or "", action="dbmgr_import", job_id=body.slug,
+                        status_code=200, details={"target": env, "coll": body.coll,
+                        "inserted": inserted, "skipped": skipped, "failed": failed})
+    except Exception:
+        pass
+    return {"ok": True, "inserted": inserted, "skipped": skipped, "failed": failed, "total": len(docs)}
+
+
+@api.post("/dbcopy/inspect")
+async def dbcopy_inspect(body: DbCopyBody):
+    return await _dbcopy(body.job_id, body.collection, "upsert", True)
+
+
+@api.post("/dbcopy/run")
+async def dbcopy_run(body: DbCopyBody):
+    mode = "replace" if (body.mode or "").lower() == "replace" else "upsert"
+    r = await _dbcopy(body.job_id, body.collection, mode, False)
+    try:
+        await audit.log(operator=body.operator or "", action="dbcopy_run", job_id=body.job_id,
+                        status_code=200 if r.get("ok") else 0,
+                        details={"collection": body.collection or "ALL", "mode": mode})
+    except Exception:
+        pass
+    return r
+
 
 @api.post("/fingerprint/lookup")
 async def fingerprint_lookup(body: JobBody):

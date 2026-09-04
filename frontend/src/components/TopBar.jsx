@@ -1,7 +1,7 @@
 import React from "react";
+import { Link } from "react-router-dom";
 import { useApp } from "@/context/AppContext";
 import { useAuth } from "@/context/AuthContext";
-import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -11,19 +11,11 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Search, Sun, Moon, LogOut, User as UserIcon } from "lucide-react";
+import { Sun, Moon, LogOut, User as UserIcon, HelpCircle } from "lucide-react";
 
 export default function TopBar() {
-  const { jobId, setJobId, dark, setDark } = useApp();
+  const { dark, setDark } = useApp();
   const { user, logout } = useAuth();
-  const [local, setLocal] = React.useState(jobId);
-
-  React.useEffect(() => setLocal(jobId), [jobId]);
-
-  const submit = (e) => {
-    e.preventDefault();
-    setJobId((local || "").trim());
-  };
 
   const initials = React.useMemo(() => {
     const src = user?.name || user?.email || "?";
@@ -38,25 +30,19 @@ export default function TopBar() {
   return (
     <header
       data-testid="topbar"
-      className="h-14 shrink-0 border-b border-border bg-background flex items-center gap-3 px-6"
+      className="h-14 shrink-0 border-b border-border bg-background flex items-center px-6"
     >
-      <form onSubmit={submit} className="flex items-center gap-2 flex-1 max-w-2xl">
-        <div className="relative flex-1">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-          <Input
-            data-testid="jobid-input"
-            value={local}
-            onChange={(e) => setLocal(e.target.value)}
-            placeholder="Search job_id — Enter to load"
-            className="pl-9 mono h-9 border-border"
-          />
-        </div>
-        <Button data-testid="jobid-submit" type="submit" size="sm" className="h-9">
-          Load
-        </Button>
-      </form>
-
-      <div className="flex items-center gap-2 pl-6 border-l border-border">
+      <div className="flex items-center gap-2 ml-auto">
+        <Link
+          to="/help"
+          target="_blank"
+          rel="noopener noreferrer"
+          data-testid="help-link"
+          title="Help & Docs (opens in new tab)"
+          className="h-9 w-9 grid place-items-center rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary"
+        >
+          <HelpCircle className="h-4 w-4" />
+        </Link>
         <Button
           variant="ghost"
           size="icon"

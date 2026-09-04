@@ -121,3 +121,13 @@ async def android_keystore_upload(job_id: str, user_id: str, filename: str,
         headers={"X-User-ID": user_id},
         files={"pem_file": (filename, content, content_type)},
     )
+
+
+# --- custom domains -------------------------------------------------------
+
+async def domains_list(user_id: str) -> dict:
+    return await _request("GET", "/api/v1/domains", headers={"X-User-ID": user_id})
+
+
+async def domain_delete(domain: str, user_id: str) -> dict:
+    return await _request("DELETE", f"/api/v1/domains/{domain}", headers={"X-User-ID": user_id})

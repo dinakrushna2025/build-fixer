@@ -152,28 +152,23 @@ export default function Diagnose() {
               </p>
             )}
             {logs && (
-              <ResponseDrawer
-                title="Logs response"
-                status={logs.status}
-                data={logs.data}
-                error={logs.error}
-                defaultOpen
-                testId="logs-response"
-              />
+              <div className="space-y-2">
+                {logs.ok === false && <p className="text-sm text-red-500">{typeof logs.error === "string" ? logs.error : "Log fetch failed"}</p>}
+                {logs.data?.found === false && <p className="text-sm text-muted-foreground">No build or logs found for this job.</p>}
+                {logs.data && (
+                  <>
+                    <div className="text-xs mono text-muted-foreground">
+                      {logs.data.app ? ("app: " + logs.data.app) : ""}{logs.data.status_note ? (" · " + logs.data.status_note) : ""}
+                    </div>
+                    <pre className="text-[11px] mono whitespace-pre-wrap break-all bg-secondary rounded-md p-3 overflow-x-auto max-h-[60vh]">{JSON.stringify(logs.data, null, 2)}</pre>
+                  </>
+                )}
+              </div>
             )}
           </CardContent>
         </Card>
       )}
 
-      {raw && (
-        <ResponseDrawer
-          title="Raw /diagnose response"
-          status={raw.status}
-          data={raw.data}
-          error={raw.error}
-          testId="diagnose-raw"
-        />
-      )}
     </div>
   );
 }
