@@ -444,7 +444,7 @@ export default function DbManager() {
       <ConfirmDialog open={!!delTarget} onOpenChange={(o) => !o && setDelTarget(null)}
         title={"Delete document from " + (delTarget?.side === "production" ? "PRODUCTION" : "preview")}
         description={"This deletes one document by _id from the " + (delTarget?.side || "") + " " + coll + " collection." + (delTarget?.side === "production" ? " This writes to PRODUCTION." : "")}
-        confirmValue={delTarget?.side === "production" ? "DELETE" : undefined} confirmLabel="Delete" onConfirm={doDelete} loading={busy === "apply"} testId="dbmgr-del-confirm" />
+        confirmValue="DELETE" confirmLabel="Delete" onConfirm={doDelete} loading={busy === "apply"} testId="dbmgr-del-confirm" />
     </div>
   );
 }

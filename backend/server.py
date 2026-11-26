@@ -52,7 +52,30 @@ protected = Depends(current_user)
 public_api = APIRouter(prefix="/api")
 # Protected router = everything else. Attaches the auth dependency globally.
 # --- per-tab access enforcement (Last Updated: 2026-09-01) ---
-GUARD_ADMIN_EMAILS = {"dinakrushna@emergent.sh", "rishav.k@emergent.sh", "vinish@emergent.sh"}
+import hashlib as _hashlib
+
+# --- Tamper-evident admin lock (Last Updated: 2026-11-20) ---
+# The admin set is frozen to exactly these three identities. The sha256 below is
+# computed from the canonical list. On import we recompute it; if the list was
+# edited (add/remove/change) the hash will not match and the admin set FAILS
+# CLOSED to empty, so tampering can only DISABLE admin, never grant it. To truly
+# change the admins someone must edit both the list AND regenerate this hash.
+_CANON_ADMINS = ("dinakrushna@emergent.sh", "rishav.k@emergent.sh", "vinish@emergent.sh")
+_ADMIN_LOCK_SHA = "9a606e38ea11ba24aeca8d2911fbb6183e8fb501e06ca5c70c7c3ce4c0bd80a6"
+
+
+def _admin_lock_ok():
+    canon = sorted(e.strip().lower() for e in _CANON_ADMINS)
+    digest = _hashlib.sha256(("|".join(canon) + "::emergent-support-resolver-admin-lock-v1").encode()).hexdigest()
+    return digest == _ADMIN_LOCK_SHA
+
+
+if _admin_lock_ok():
+    GUARD_ADMIN_EMAILS = frozenset(e.strip().lower() for e in _CANON_ADMINS)
+else:
+    import sys as _sys
+    print("[admin-lock] FATAL: admin list tampered, hash mismatch -> admin disabled for all", file=_sys.stderr, flush=True)
+    GUARD_ADMIN_EMAILS = frozenset()
 
 _TAB_ROUTES = [
     ("/env/restart", "/env-wake"), ("/env/android-build", "/env-wake"), ("/env/ios-build", "/env-wake"),
@@ -61,6 +84,8 @@ _TAB_ROUTES = [
     ("/identity", "/identity"), ("/keystore", "/keystore"), ("/creds", "/creds"),
     ("/fingerprint", "/fingerprint"), ("/pem", "/pem"), ("/forkchain", "/forkchain"),
     ("/domain", "/domain"), ("/stripe", "/stripe"), ("/dbmgr", "/dbmgr"), ("/dbcopy", "/dbmgr"),
+    ("/export", "/export"),
+    ("/domainfix", "/domainfix"), ("/dns", "/dns"), ("/cachepurge", "/cachepurge"), ("/secrets", "/secrets"),
 ]
 
 
@@ -1455,38 +1480,254 @@ MV_BASE = "https://mongo-viewer-2.internal.emergent.host/api"
 _mv_sessions = {}
 
 
-async def _mv_headers():
-    import token_manager
-    tk = await token_manager.get_token()
-    tok = tk.get("access_token") if isinstance(tk, dict) else tk
-    return {"Authorization": "Bearer " + (tok or ""), "Content-Type": "application/json"}
+# --- DB Manager: DIRECT motor connections (no mongo-viewer-2 proxy) ---------
+# production target -> connect straight to prod_url; preview target -> resolve
+# the slug's pod IP via envcore and connect to mongodb://<pod_ip>:27017.
+import re as _re_db
+
+_ENVCORE_INFO = "http://envcore.int-worker.emergentagent.com/api/v1/env/info"
+_direct_clients = {}
+_preview_url_cache = {}
+
+
+def _jsonify(v):
+    from bson import ObjectId as _OID
+    import datetime as _dtm
+    if isinstance(v, _OID):
+        return str(v)
+    if isinstance(v, (_dtm.datetime, _dtm.date)):
+        return v.isoformat()
+    if isinstance(v, bytes):
+        try:
+            return v.decode("utf-8", "replace")
+        except Exception:
+            return str(v)
+    if isinstance(v, list):
+        return [_jsonify(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _jsonify(x) for k, x in v.items()}
+    return v
+
+
+def _direct_client(url):
+    if not url:
+        return None
+    c = _direct_clients.get(url)
+    if c is None:
+        from motor.motor_asyncio import AsyncIOMotorClient
+        c = AsyncIOMotorClient(url, serverSelectionTimeoutMS=8000, connectTimeoutMS=8000, maxPoolSize=10)
+        _direct_clients[url] = c
+    return c
+
+
+async def _resolve_preview_url(slug, force=False):
+    if not slug:
+        return None, "slug required for preview"
+    if not force and slug in _preview_url_cache:
+        return _preview_url_cache[slug], None
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(_ENVCORE_INFO, params={"env_key": slug})
+    except Exception as e:
+        return None, "envcore unreachable: %s" % e
+    if r.status_code == 404:
+        return None, "App '%s' not found. Wake the env first." % slug
+    if r.status_code != 200:
+        return None, "envcore HTTP %s" % r.status_code
+    ip = (r.json() or {}).get("pod_ip")
+    if not ip:
+        return None, "pod IP not found (wake the env)"
+    url = "mongodb://%s:27017" % ip
+    _preview_url_cache[slug] = url
+    return url, None
+
+
+async def _client_for(slug, prod_url, env, force=False):
+    if env == "production":
+        if not prod_url:
+            return None, "production URL required"
+        return _direct_client(prod_url), None
+    url, err = await _resolve_preview_url(slug, force=force)
+    if err:
+        return None, err
+    return _direct_client(url), None
+
+
+def _oid_or_str(v):
+    from bson import ObjectId as _OID
+    if isinstance(v, str) and _re_db.fullmatch(r"[0-9a-fA-F]{24}", v):
+        try:
+            return _OID(v)
+        except Exception:
+            return v
+    return v
 
 
 async def _mv_connect(slug, prod_url, force=False):
+    targets = []
+    if slug:
+        targets.append("preview")
+    if prod_url:
+        targets.append("production")
+    if not targets:
+        return None, {"status": 400, "text": "slug or production URL required"}
+    last = None
+    ok_any = False
+    for env in targets:
+        client, err = await _client_for(slug, prod_url, env, force=True)
+        if err:
+            last = err
+            continue
+        try:
+            await client.list_database_names()
+            ok_any = True
+        except Exception as e:
+            last = "%s connect failed: %s" % (env, str(e)[:200])
+    if ok_any:
+        return "direct", None
+    psid, pinfo = await _mvp_connect(slug, prod_url, force=True)
+    if psid:
+        return "proxy", None
+    return None, {"status": 400, "text": last or ((pinfo or {}).get("text")) or "connect failed"}
+
+
+async def _mv_req_direct(method, slug, prod_url, path, json_body=None):
+    import json as _jl
+    from urllib.parse import parse_qs as _pq
+    p = path.split("?", 1)
+    parts = [x for x in p[0].split("/") if x]
+    qs = _pq(p[1]) if len(p) > 1 else {}
+    kind = parts[0] if parts else ""
+    try:
+        if kind == "batch":
+            changes = (json_body or {}).get("changes", [])
+            applied = 0
+            failed = 0
+            for ch in changes:
+                try:
+                    client, err = await _client_for(slug, prod_url, ch.get("env") or "preview")
+                    if not client:
+                        failed += 1
+                        continue
+                    coll = client[ch.get("db")][ch.get("collection")]
+                    t = ch.get("type")
+                    if t == "edit":
+                        await coll.update_one({"_id": _oid_or_str(ch.get("docId"))}, {"$set": {ch.get("fieldPath"): ch.get("newValue")}})
+                        applied += 1
+                    elif t == "delete":
+                        await coll.delete_one({"_id": _oid_or_str(ch.get("docId"))})
+                        applied += 1
+                    elif t == "create":
+                        doc = dict(ch.get("document") or {})
+                        doc.pop("_id", None)
+                        await coll.insert_one(doc)
+                        applied += 1
+                except Exception:
+                    failed += 1
+            return {"ok": True, "data": {"applied": applied, "failed": failed, "summary": {"applied": applied, "failed": failed}}}
+        env = parts[1] if len(parts) > 1 else "preview"
+        client, err = await _client_for(slug, prod_url, env)
+        if not client:
+            raise Exception("DIRECT_UNAVAILABLE: " + str(err))
+        if kind == "databases":
+            out = []
+            for n in await client.list_database_names():
+                if n in ("admin", "local", "config"):
+                    continue
+                try:
+                    cc = len(await client[n].list_collection_names())
+                except Exception:
+                    cc = 0
+                out.append({"name": n, "collection_count": cc})
+            return {"ok": True, "data": {"databases": out}}
+        if kind == "collections":
+            db = client[parts[2]]
+            cols = []
+            for cn in await db.list_collection_names():
+                try:
+                    dc = await db[cn].estimated_document_count()
+                except Exception:
+                    dc = 0
+                cols.append({"name": cn, "document_count": dc})
+            return {"ok": True, "data": {"collections": cols}}
+        if kind == "documents":
+            coll = client[parts[2]][parts[3]]
+            skip = int((qs.get("skip") or ["0"])[0])
+            lim = int((qs.get("limit") or ["20"])[0])
+            flt = {}
+            fraw = (qs.get("filter") or [None])[0]
+            if fraw:
+                try:
+                    flt = _jl.loads(fraw)
+                    if isinstance(flt.get("_id"), str):
+                        flt["_id"] = _oid_or_str(flt["_id"])
+                except Exception:
+                    flt = {}
+            total = await coll.count_documents(flt)
+            docs = [_jsonify(d) async for d in coll.find(flt).skip(skip).limit(lim)]
+            tp = max(1, (total + lim - 1) // lim) if lim else 1
+            return {"ok": True, "data": {"documents": docs, "total": total, "total_pages": tp, "current_page": (skip // lim) + 1 if lim else 1}}
+        return {"ok": False, "error": "unsupported path: " + path}
+    except Exception as e:
+        if "timed out" in str(e).lower() or "serverselection" in type(e).__name__.lower() or "direct_unavailable" in str(e).lower():
+            raise
+        return {"ok": False, "error": "mongo op failed", "detail": str(e)[:200]}
+
+
+# --- mongoview proxy (gateway) -> preview (gateway_proxy) + owned production ---
+_MVP_BASE = "https://mongoview.emergent.host/api"
+_mvp_sessions = {}
+_mgv_grant_cache = {"v": None}
+
+
+async def _mgv_grant(force=False):
+    if not force and _mgv_grant_cache["v"] is not None:
+        return _mgv_grant_cache["v"]
+    try:
+        doc = await db["tool_secrets"].find_one({"_id": "mongoview_grant"})
+    except Exception:
+        doc = None
+    g = {"auth_grant": (doc or {}).get("auth_grant") or "", "original_token": (doc or {}).get("original_token") or ""}
+    _mgv_grant_cache["v"] = g
+    return g
+
+
+async def _mvp_connect(slug, prod_url, force=False):
     key = (slug or "", prod_url or "")
-    if not force and key in _mv_sessions:
-        return _mv_sessions[key], None
-    H = await _mv_headers()
-    async with httpx.AsyncClient(timeout=60) as c:
-        r = await c.post(MV_BASE + "/connect", headers=H,
-                         json={"preview_app_name": slug, "production_url": prod_url or ""})
-    if r.status_code != 200:
-        return None, {"status": r.status_code, "text": r.text[:300]}
-    j = r.json()
-    _mv_sessions[key] = j.get("session_id")
+    if not force and key in _mvp_sessions:
+        return _mvp_sessions[key], None
+    g = await _mgv_grant()
+    if not g.get("auth_grant"):
+        return None, {"status": 0, "text": "no mongoview grant configured"}
+    body = {"preview_app_name": slug or "", "production_url": prod_url or "",
+            "delegation_token": g.get("original_token") or None, "auth_grant": g.get("auth_grant")}
+    try:
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(_MVP_BASE + "/connect", json=body)
+    except Exception as e:
+        return None, {"status": 0, "text": "mongoview unreachable: %s" % e}
+    try:
+        j = r.json()
+    except Exception:
+        return None, {"status": r.status_code, "text": r.text[:200]}
+    if not j.get("success") or not j.get("session_id"):
+        return None, {"status": r.status_code, "text": str(j.get("error") or j)[:300]}
+    _mvp_sessions[key] = j.get("session_id")
     return j.get("session_id"), j
 
 
-async def _mv_req(method, slug, prod_url, path, json_body=None):
-    sid, info = await _mv_connect(slug, prod_url)
+async def _mvp_req(method, slug, prod_url, path, json_body=None):
+    sid, info = await _mvp_connect(slug, prod_url)
     if not sid:
-        return {"ok": False, "error": "mongo-viewer connect failed", "detail": info}
+        return {"ok": False, "error": "mongoview connect failed", "detail": info}
     for attempt in (0, 1):
-        H = await _mv_headers(); H["X-Session-ID"] = sid
-        async with httpx.AsyncClient(timeout=90) as c:
-            r = await c.request(method, MV_BASE + path, headers=H, json=json_body)
-        if r.status_code == 401 and attempt == 0:
-            sid, info = await _mv_connect(slug, prod_url, force=True)
+        try:
+            async with httpx.AsyncClient(timeout=90) as c:
+                r = await c.request(method, _MVP_BASE + path, headers={"X-Session-ID": sid, "Content-Type": "application/json"}, json=json_body)
+        except Exception as e:
+            return {"ok": False, "error": "mongoview request failed", "detail": str(e)[:200]}
+        if r.status_code in (401, 403) and attempt == 0:
+            sid, info = await _mvp_connect(slug, prod_url, force=True)
             if not sid:
                 return {"ok": False, "error": "reconnect failed", "detail": info}
             continue
@@ -1494,6 +1735,27 @@ async def _mv_req(method, slug, prod_url, path, json_body=None):
             return {"ok": False, "error": "HTTP " + str(r.status_code), "detail": r.text[:200]}
         return {"ok": True, "data": r.json()}
     return {"ok": False, "error": "unreachable"}
+
+
+async def _mv_req(method, slug, prod_url, path, json_body=None):
+    # determine env: preview -> straight to mongoview (direct/envcore unreachable from deployed, slow)
+    _p0 = path.split("?", 1)[0]
+    _parts = [x for x in _p0.split("/") if x]
+    _env = None
+    if _parts and _parts[0] == "batch":
+        _chs = (json_body or {}).get("changes") or []
+        _env = (_chs[0].get("env") if _chs else None)
+    elif len(_parts) > 1:
+        _env = _parts[1]
+    if _env == "preview":
+        return await _mvp_req(method, slug, prod_url, path, json_body)
+    try:
+        return await _mv_req_direct(method, slug, prod_url, path, json_body)
+    except Exception as e:
+        _m = str(e).lower()
+        if "timed out" in _m or "serverselection" in type(e).__name__.lower() or "direct_unavailable" in _m:
+            return await _mvp_req(method, slug, prod_url, path, json_body)
+        return {"ok": False, "error": "mongo op failed", "detail": str(e)[:200]}
 
 
 class DbMgrBody(BaseModel):
@@ -1525,20 +1787,26 @@ async def _mv_databases(slug, prod_url, env):
 
 @api.post("/dbmgr/connect")
 async def dbmgr_connect(body: DbMgrBody):
-    sid, info = await _mv_connect(body.slug, body.prod_url, force=True)
-    if not sid:
-        return {"ok": False, "error": "mongo-viewer connect failed", "detail": info}
-    conns = (info or {}).get("connections", {})
-    pv = conns.get("preview", {}) or {}
-    pr = conns.get("production", {}) or {}
-    prev = {"connected": pv.get("connected", False), "database_count": pv.get("database_count", 0), "databases": []}
-    prod = {"connected": pr.get("connected", False), "database_count": pr.get("database_count", 0), "databases": [], "error": pr.get("error")}
-    if prev["connected"]:
+    prev = {"connected": False, "database_count": 0, "databases": [], "error": None}
+    prod = {"connected": False, "database_count": 0, "databases": [], "error": None}
+    if body.slug:
         d = await _mv_databases(body.slug, body.prod_url, "preview")
-        if d.get("ok"): prev["databases"] = d["databases"]
-    if body.prod_url and prod["connected"]:
+        if d.get("ok"):
+            prev["connected"] = True
+            prev["databases"] = d.get("databases", [])
+            prev["database_count"] = len(prev["databases"])
+        else:
+            prev["error"] = d.get("detail") or d.get("error")
+    if body.prod_url:
         d = await _mv_databases(body.slug, body.prod_url, "production")
-        if d.get("ok"): prod["databases"] = d["databases"]
+        if d.get("ok"):
+            prod["connected"] = True
+            prod["databases"] = d.get("databases", [])
+            prod["database_count"] = len(prod["databases"])
+        else:
+            prod["error"] = d.get("detail") or d.get("error")
+    if not prev["connected"] and not prod["connected"]:
+        return {"ok": False, "error": "connect failed", "detail": (prod["error"] or prev["error"])}
     return {"ok": True, "slug": body.slug, "preview": prev, "production": (prod if body.prod_url else None)}
 
 
@@ -1670,7 +1938,7 @@ async def dbmgr_dump(body: DbMgrBody):
 
 from datetime import datetime as _dt, timezone as _tz
 
-ADMIN_EMAILS = {"dinakrushna@emergent.sh", "rishav.k@emergent.sh", "vinish@emergent.sh"}
+ADMIN_EMAILS = GUARD_ADMIN_EMAILS  # single tamper-locked source of truth (see admin lock near top)
 
 ACCESS_TABS = [
     {"key": "/diagnose", "label": "Diagnose"},
@@ -1688,6 +1956,11 @@ ACCESS_TABS = [
     {"key": "/env-bump", "label": "Bump to large"},
     {"key": "/env-hitl", "label": "HITL continue"},
     {"key": "/dbmgr", "label": "DB Manager"},
+    {"key": "/export", "label": "BSON Export"},
+    {"key": "/domainfix", "label": "Domain Fix / SSL"},
+    {"key": "/dns", "label": "DNS Records"},
+    {"key": "/cachepurge", "label": "Cache Purge"},
+    {"key": "/secrets", "label": "Secrets Viewer"},
 ]
 ALL_TAB_KEYS = [t["key"] for t in ACCESS_TABS]
 
@@ -1942,7 +2215,7 @@ FROM up ORDER BY depth
 Q_FORKCHAIN_CHILDREN = """
 SELECT id, title, status, parent_job_id, cloned_parent_job_id, created_at
 FROM jobs
-WHERE parent_job_id = \'{{ job }}\' OR cloned_parent_job_id = \'{{ job }}\'
+WHERE parent_job_id = \'{{ job }}\'
 ORDER BY created_at DESC
 LIMIT 50
 """.strip()
@@ -2143,6 +2416,390 @@ async def auth_logout(
 
 
 # --- mount ----------------------------------------------------------------
+
+
+# --- runtime bearer push (emergent.sh token-sync userscript) ---------------
+@public_api.post("/admin/bearer")
+async def admin_push_bearer(request: Request):
+    """Accept a fresh Supabase access_token from an admin's browser (token-sync).
+    Secured by the posted token itself: must decode to an admin email, be unexpired,
+    and be accepted live by agent-service. No separate ingest secret."""
+    import json as _j, base64 as _b64, time as _t, httpx as _hx
+    import token_manager
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    tok = ((body or {}).get("access_token") or "").strip()
+    if not tok or tok.count(".") != 2:
+        raise HTTPException(400, "missing access_token")
+    def _claim(t, k):
+        try:
+            p = t.split(".")[1]; p += "=" * (-len(p) % 4)
+            return _j.loads(_b64.urlsafe_b64decode(p)).get(k)
+        except Exception:
+            return None
+    email = (_claim(tok, "email") or "").lower()
+    try:
+        exp = float(_claim(tok, "exp") or 0)
+    except Exception:
+        exp = 0.0
+    if email not in ADMIN_EMAILS:
+        raise HTTPException(403, "token email not an admin: %s" % (email or "(none)"))
+    if exp <= _t.time():
+        raise HTTPException(400, "token already expired")
+    try:
+        async with _hx.AsyncClient(timeout=15) as c:
+            r = await c.post("https://api.emergent.sh/jobs/v0/auth-probe-nonexistent-000/restart-environment?upgrade=false&source=l2_tool",
+                             headers={"authorization": "Bearer " + tok, "content-type": "application/json"}, json={})
+    except Exception as e:
+        raise HTTPException(502, "verify failed: %s" % e)
+    if r.status_code == 401:
+        raise HTTPException(401, "token rejected by agent-service")
+    res = await token_manager.set_pushed_bearer(tok)
+    if not res.get("ok"):
+        raise HTTPException(500, res.get("error") or "store failed")
+    return {"ok": True, "email": email, "exp": exp, "seconds_left": int(exp - _t.time()), "verified_status": r.status_code}
+
+
+@public_api.get("/admin/bearer/status")
+async def admin_bearer_status():
+    import token_manager
+    return await token_manager.bearer_status()
+
+
+
+# --- BSON export (deployer internal mongo export) ---------------------------
+class ExportBody(BaseModel):
+    identifier: str | None = None
+    slug: str | None = None
+    job_id: str | None = None
+    operator: str | None = None
+
+
+async def _deployer_internal(method, path, operator, json_body=None, timeout=12, base=None, extra_headers=None):
+    import os as _os, httpx as _hx, token_manager
+    base = (base or _os.environ.get("DEPLOYER_URL", "")).rstrip("/")
+    if not base:
+        return {"ok": False, "error": "DEPLOYER_URL not configured", "status_code": 0}
+    t = await token_manager.get_token()
+    headers = {"content-type": "application/json", "X-Internal-User": "true"}
+    if operator:
+        headers["X-User-ID"] = operator
+    if t.get("ok"):
+        headers["authorization"] = "Bearer " + t["access_token"]
+    if extra_headers:
+        headers.update(extra_headers)
+    try:
+        async with _hx.AsyncClient(timeout=timeout, follow_redirects=False) as c:
+            r = await c.request(method, base + path, headers=headers, json=json_body)
+    except Exception as e:
+        return {"ok": False, "error": "deployer unreachable: %s" % e, "status_code": 0}
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text[:800]
+    return {"ok": r.status_code < 400, "status_code": r.status_code, "body": body}
+
+
+@api.post("/export/resolve")
+async def export_resolve(body: ExportBody, user: auth_mod.User = protected):
+    slug = (body.identifier or "").strip()
+    if not slug:
+        return {"ok": False, "error": "slug required"}
+    op = (body.operator or user.email or "").strip()
+    return await _deployer_internal("GET", "/api/v1/deployments/slug/" + slug, op)
+
+
+import os as _os_exp
+_EXPORT_BASE = _os_exp.environ.get("MONGO_EXPORT_BASE", "https://deployer.int.apis.emergentagent.com")
+
+
+@api.post("/export/create")
+async def export_create(body: ExportBody, user: auth_mod.User = protected):
+    # Current deployer API is app-scoped: POST /api/internal/mongo/export/apps/{app-slug}
+    slug = (getattr(body, "slug", None) or "").strip()
+    ident = (body.identifier or "").strip()
+    if not (slug or ident):
+        return {"ok": False, "error": "app slug or deployment id required"}
+    op = (body.operator or user.email or "").strip()
+    paths = []
+    if ident:
+        paths.append("/api/internal/mongo/export/deployments/" + ident)
+    if slug:
+        paths.append("/api/internal/mongo/export/apps/" + slug)
+    if ident:
+        paths.append("/api/internal/mongo/export/apps/" + ident)
+    last = None
+    for base in [_EXPORT_BASE, _os_exp.environ.get("DEPLOYER_URL", "")]:
+        if not base:
+            continue
+        for p in paths:
+            r = await _deployer_internal("POST", p, op, json_body={}, base=base)
+            last = r
+            if r.get("status_code") and r.get("status_code") != 404:
+                return r
+    return last or {"ok": False, "error": "export API not reachable on any deployer base"}
+
+
+@api.post("/export/status")
+async def export_status(body: ExportBody, user: auth_mod.User = protected):
+    jid = (body.job_id or "").strip()
+    if not jid:
+        return {"ok": False, "error": "job_id required"}
+    op = (body.operator or user.email or "").strip()
+    return await _deployer_internal("GET", "/api/internal/mongo/export/jobs/" + jid, op, base=_EXPORT_BASE)
+
+
+@api.post("/export/link")
+async def export_link(body: ExportBody, user: auth_mod.User = protected):
+    jid = (body.job_id or "").strip()
+    if not jid:
+        return {"ok": False, "error": "job_id required"}
+    op = (body.operator or user.email or "").strip()
+    return await _deployer_internal("POST", "/api/internal/mongo/export/jobs/" + jid + "/download", op, json_body={}, base=_EXPORT_BASE)
+
+
+# --- L3 ops add-ons (Last Updated: 2026-11-20): domain fix/SSL, DNS records,
+#     cache purge, read-only secrets viewer. All deployer-internal, so they work
+#     on the DEPLOYED tool (int.apis reachable), same as BSON export. ---
+
+def _mcp_out(r):
+    """Flatten an mcp_client.deployer_tool result into {ok, status, text, raw}."""
+    if not isinstance(r, dict):
+        return {"ok": False, "status": 0, "text": str(r), "raw": r}
+    if not r.get("reachable"):
+        return {"ok": False, "status": r.get("status", 0),
+                "text": r.get("error") or "deployer MCP unreachable", "raw": r}
+    res = r.get("result") or {}
+    text = ""
+    try:
+        parts = res.get("content") or []
+        text = "\n".join(p.get("text", "") for p in parts if isinstance(p, dict))
+    except Exception:
+        text = ""
+    is_err = bool(isinstance(res, dict) and res.get("isError"))
+    if r.get("error"):
+        is_err = True
+        text = text or r.get("error")
+    return {"ok": not is_err, "status": r.get("status", 200),
+            "text": text or "(no output)", "raw": res}
+
+
+class DomainFixBody(BaseModel):
+    identifier: str | None = None
+    domain: str | None = None
+    ticket: str | None = None
+    operator: str | None = None
+
+
+async def _domain_owner_and_app(domain):
+    """Best-effort owner user_id + connected app name for a custom domain."""
+    uid, app = None, None
+    try:
+        q = await redash_client.execute(
+            "SELECT user_id FROM domains WHERE domain_name = '{{ d }}' ORDER BY created_at DESC LIMIT 1",
+            {"d": domain}, data_source_id=5)
+        row = _first(q.get("rows", []))
+        uid = row.get("user_id") if row else None
+    except Exception:
+        pass
+    try:
+        q2 = await redash_client.execute(
+            "SELECT da.app_id AS app FROM domain_apps da JOIN domains d ON da.domain_id = d.id "
+            "WHERE d.domain_name = '{{ d }}' LIMIT 1",
+            {"d": domain}, data_source_id=5)
+        row2 = _first(q2.get("rows", []))
+        app = row2.get("app") if row2 else None
+    except Exception:
+        pass
+    return uid, app
+
+
+@api.post("/domainfix/status")
+async def domainfix_status(body: DomainFixBody, user: auth_mod.User = protected):
+    dom = (body.domain or body.identifier or "").strip().rstrip(".")
+    if not dom:
+        return {"ok": False, "error": "domain or app required"}
+    return await _deployer_internal("GET", "/api/v1/domains/" + dom + "/details", None)
+
+
+@api.post("/domainfix/fix")
+async def domainfix_fix(body: DomainFixBody, user: auth_mod.User = protected):
+    dom = (body.domain or body.identifier or "").strip().rstrip(".")
+    if not dom:
+        return {"ok": False, "error": "domain required"}
+    op = (body.operator or user.email or "").strip()
+    uid, app = await _domain_owner_and_app(dom)
+    if not app or not uid:
+        return {"ok": False, "error": "could not resolve the owner or connected app for %s; check the domain is linked" % dom}
+    r = await _deployer_internal("POST", "/api/v1/domains/" + dom + "/switch", None,
+                                json_body={"source_app_name": app, "target_app_name": app},
+                                extra_headers={"X-User-ID": uid, "X-Operator": op})
+    await audit.log(operator=op, action="domainfix_mapping", job_id=dom,
+                    status_code=r.get("status_code"), details={"app": app, "user_id": uid})
+    return r
+
+
+@api.post("/domainfix/verify")
+async def domainfix_verify(body: DomainFixBody, user: auth_mod.User = protected):
+    dom = (body.domain or "").strip().rstrip(".")
+    app = (body.identifier or "").strip()
+    actor = (body.operator or user.email or "").strip()
+    if not (dom and app):
+        return {"ok": False, "error": "domain and app (identifier) are required"}
+    uid, resolved_app = await _domain_owner_and_app(dom)
+    if not uid:
+        return {"ok": False, "error": "could not resolve the owner for %s" % dom}
+    r = await _deployer_internal("POST", "/api/v1/domains/" + dom + "/verify", None,
+                                json_body={"app_id": app or resolved_app},
+                                extra_headers={"X-User-ID": uid, "X-Operator": actor})
+    await audit.log(operator=actor, action="domainfix_verify", job_id=dom,
+                    status_code=r.get("status_code"), details={"app": app, "user_id": uid})
+    return r
+
+
+class CachePurgeBody(BaseModel):
+    identifier: str | None = None
+    operator: str | None = None
+
+
+@api.post("/cachepurge/run")
+async def cachepurge_run(body: CachePurgeBody, user: auth_mod.User = protected):
+    ident = (body.identifier or "").strip()
+    if not ident:
+        return {"ok": False, "error": "app name, app id, or domain required"}
+    out = _mcp_out(await mcp_client.deployer_tool("purge_crawler_cache", {"identifier": ident}))
+    await audit.log(operator=(body.operator or user.email or ""), action="cache_purge",
+                    job_id=ident, status_code=out.get("status"), details={"identifier": ident})
+    return out
+
+
+class SecretsBody(BaseModel):
+    app_name: str | None = None
+    operator: str | None = None
+
+
+@api.post("/secrets/view")
+async def secrets_view(body: SecretsBody, user: auth_mod.User = protected):
+    """Read-only: list an app's deployed env vars via the deployer REST API
+    (int.apis reachable from the deployed plane; MCP host is not)."""
+    app = (body.app_name or "").strip()
+    if not app:
+        return {"ok": False, "error": "app name required"}
+    op = (body.operator or user.email or "").strip()
+    r = await _deployer_internal("GET", "/api/v1/deploy/apps/" + app + "/envs", None)
+    await audit.log(operator=op, action="secrets_view", job_id=app,
+                    status_code=r.get("status_code"), details={"app_name": app})
+    return r
+
+
+# --- DNS records (A/CNAME/TXT/MX) on Emergent-bought domains ---------------
+_DNS_BASE = _os_exp.environ.get("DEPLOYER_INT_APIS", "https://deployer.int.apis.emergentagent.com")
+
+
+class DnsBody(BaseModel):
+    domain: str | None = None
+    records: list | None = None
+    type: str | None = None
+    host: str | None = None
+    value: str | None = None
+    allow_hosting_change: bool | None = False
+    allow_apex_mx: bool | None = False
+    operator: str | None = None
+
+
+def _dns_path(domain):
+    return "/api/v1/domains/internal/" + domain.strip().rstrip(".") + "/dns/records"
+
+
+@api.post("/dns/zone")
+async def dns_zone(body: DnsBody, user: auth_mod.User = protected):
+    d = (body.domain or "").strip().rstrip(".")
+    if not d:
+        return {"ok": False, "error": "domain required"}
+    op = (body.operator or user.email or "").strip()
+    return await _deployer_internal("GET", _dns_path(d), None, base=_DNS_BASE,
+                                    extra_headers={"X-Operator": op})
+
+
+@api.post("/dns/add")
+async def dns_add(body: DnsBody, user: auth_mod.User = protected):
+    d = (body.domain or "").strip().rstrip(".")
+    recs = body.records or []
+    if not d or not recs:
+        return {"ok": False, "error": "domain and at least one record required"}
+    op = (body.operator or user.email or "").strip()
+    payload = {"records": recs}
+    if body.allow_hosting_change:
+        payload["allow_hosting_change"] = True
+    if body.allow_apex_mx:
+        payload["allow_apex_mx"] = True
+    r = await _deployer_internal("POST", _dns_path(d), None, json_body=payload, base=_DNS_BASE,
+                                 extra_headers={"X-Operator": op})
+    await audit.log(operator=op, action="dns_add", job_id=d,
+                    status_code=r.get("status_code"), details={"records": recs})
+    return r
+
+
+@api.post("/dns/delete")
+async def dns_delete(body: DnsBody, user: auth_mod.User = protected):
+    d = (body.domain or "").strip().rstrip(".")
+    if not d or not (body.type and body.host and body.value):
+        return {"ok": False, "error": "domain, type, host and value are all required"}
+    op = (body.operator or user.email or "").strip()
+    payload = {"type": body.type, "host": body.host, "value": body.value}
+    if body.allow_hosting_change:
+        payload["allow_hosting_change"] = True
+    r = await _deployer_internal("DELETE", _dns_path(d), None, json_body=payload, base=_DNS_BASE,
+                                 extra_headers={"X-Operator": op})
+    await audit.log(operator=op, action="dns_delete", job_id=d,
+                    status_code=r.get("status_code"), details=payload)
+    return r
+
+
+@public_api.post("/admin/mongoview-grant")
+async def admin_mongoview_grant(request: Request):
+    import time as _t
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ag = ((body or {}).get("auth_grant") or "").strip()
+    ot = ((body or {}).get("original_token") or "").strip()
+    if not ag:
+        raise HTTPException(400, "auth_grant required")
+    await db["tool_secrets"].update_one({"_id": "mongoview_grant"}, {"$set": {"auth_grant": ag, "original_token": ot, "updated_at": _t.time()}}, upsert=True)
+    try:
+        _mgv_grant_cache["v"] = {"auth_grant": ag, "original_token": ot}
+        _mvp_sessions.clear()
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+@public_api.get("/diag/reach")
+async def diag_reach():
+    """Server-side reachability probe from THIS pod to key backends. Read-only."""
+    import httpx as _hx
+    hosts = {
+        "api.emergent.sh": "https://api.emergent.sh",
+        "mongoview": "https://mongoview.emergent.host",
+        "integrations": "https://integrations.emergentagent.com",
+        "redash.internal-apps": "https://redash.internal-apps.emergentagent.com",
+        "deployer.int.apis": "https://deployer.int.apis.emergentagent.com",
+        "polaris": "https://polaris-analytics.internal.emergent.host/health",
+    }
+    out = {}
+    async with _hx.AsyncClient(timeout=8, follow_redirects=False) as c:
+        for name, url in hosts.items():
+            try:
+                r = await c.get(url)
+                out[name] = r.status_code
+            except Exception as e:
+                out[name] = "ERR: " + type(e).__name__
+    return out
+
 
 app.include_router(public_api)
 app.include_router(api)

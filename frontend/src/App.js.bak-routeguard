@@ -1,0 +1,167 @@
+import React from "react";
+import { Navigate, Route, Routes, useLocation } from "react-router-dom";
+import "@/App.css";
+import Sidebar from "@/components/Sidebar";
+import TopBar from "@/components/TopBar";
+import Diagnose from "@/pages/Diagnose";
+import FindExpo from "@/pages/FindExpo";
+import FixIdentity from "@/pages/FixIdentity";
+import Keystore from "@/pages/Keystore";
+import CredsRetry from "@/pages/CredsRetry";
+import FingerprintPage from "@/pages/Fingerprint";
+import PemKms from "@/pages/PemKms";
+import ForkChain from "@/pages/ForkChain";
+import Domain from "@/pages/Domain";
+import Stripe from "@/pages/Stripe";
+import EnvWake from "@/pages/EnvWake";
+import EnvKick from "@/pages/EnvKick";
+import EnvBump from "@/pages/EnvBump";
+import EnvHitl from "@/pages/EnvHitl";
+import DbManager from "@/pages/DbManager";
+import AccessAdmin from "@/pages/AccessAdmin";
+import Export from "@/pages/Export";
+import Help from "@/pages/Help";
+import Login from "@/pages/Login";
+import AuthCallback from "@/pages/AuthCallback";
+import { Toaster } from "@/components/ui/sonner";
+import { useAuth } from "@/context/AuthContext";
+import { AccessProvider, useAccess } from "@/context/AccessContext";
+import { Loader2 } from "lucide-react";
+
+function Shell() {
+  return (
+    <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">
+      <Sidebar />
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <TopBar />
+        <main
+          data-testid="main"
+          className="flex-1 overflow-y-auto thin-scroll px-8 py-6 max-w-[1440px] w-full mx-auto"
+        >
+          <Routes>
+            <Route path="/" element={<Navigate to="/diagnose" replace />} />
+            <Route path="/diagnose" element={<Diagnose />} />
+            <Route path="/expo" element={<FindExpo />} />
+            <Route path="/identity" element={<FixIdentity />} />
+            <Route path="/keystore" element={<Keystore />} />
+            <Route path="/creds" element={<CredsRetry />} />
+            <Route path="/fingerprint" element={<FingerprintPage />} />
+            <Route path="/pem" element={<PemKms />} />
+            <Route path="/forkchain" element={<ForkChain />} />
+            <Route path="/domain" element={<Domain />} />
+            <Route path="/stripe" element={<Stripe />} />
+            <Route path="/env-wake" element={<EnvWake />} />
+            <Route path="/env-kick" element={<EnvKick />} />
+            <Route path="/env-bump" element={<EnvBump />} />
+            <Route path="/env-hitl" element={<EnvHitl />} />
+            <Route path="/dbmgr" element={<DbManager />} />
+            <Route path="/export" element={<Export />} />
+            <Route path="/access" element={<AccessAdmin />} />
+            <Route path="*" element={<Navigate to="/diagnose" replace />} />
+          </Routes>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function Pending({ email }) {
+  const { logout } = useAuth();
+  return (
+    <div className="h-screen w-screen grid place-items-center bg-background text-foreground p-6">
+      <div className="max-w-md text-center space-y-4">
+        <div className="h-14 w-14 rounded-2xl bg-amber-100 grid place-items-center mx-auto"><Loader2 className="h-7 w-7 text-amber-600 animate-spin" /></div>
+        <h1 className="text-xl font-semibold">Access pending approval</h1>
+        <p className="text-sm text-muted-foreground">Your request has been sent to the admins. You will get access to your tools once an admin approves your account{email ? (" (" + email + ")") : ""}.</p>
+        <button onClick={logout} className="text-sm text-primary hover:underline">Sign out</button>
+      </div>
+    </div>
+  );
+}
+
+function Gate() {
+  const { access, loading } = useAccess();
+  if (loading || !access) {
+    return (
+      <div className="h-screen w-screen grid place-items-center bg-background text-muted-foreground">
+        <div className="flex items-center gap-3"><Loader2 className="h-4 w-4 animate-spin" /><span className="text-sm">Checking access…</span></div>
+      </div>
+    );
+  }
+  if (!access.is_admin && access.status !== "approved") {
+    return <Pending email={access.email} />;
+  }
+  return <Shell />;
+}
+
+function App() {
+  const { user, loading } = useAuth();
+  const location = useLocation();
+
+  // Detect the OAuth return fragment SYNCHRONOUSLY (before any Route matching).
+  // Playbook: `session_id=` lives in window.location.hash, not the URL path.
+  if (typeof window !== "undefined" && window.location.hash?.includes("session_id=")) {
+    return (
+      <>
+        <AuthCallback />
+        <Toaster position="top-right" richColors closeButton />
+      </>
+    );
+  }
+
+  if (loading) {
+    return (
+      <div className="h-screen w-screen grid place-items-center bg-background text-muted-foreground">
+        <div className="flex items-center gap-3">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          <span className="text-sm">Checking session…</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    // Only allow /login. Anything else redirects to /login.
+    if (location.pathname !== "/login") {
+      return <Navigate to="/login" replace />;
+    }
+    return (
+      <>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+        </Routes>
+        <Toaster position="top-right" richColors closeButton />
+      </>
+    );
+  }
+
+  // Authenticated: if user somehow lands on /login, punt to /diagnose.
+  if (location.pathname === "/login") {
+    return <Navigate to="/diagnose" replace />;
+  }
+
+  // Standalone docs page (opens in its own tab, no sidebar/topbar).
+  if (location.pathname === "/help") {
+    return (
+      <>
+        <div className="min-h-screen w-screen overflow-y-auto bg-background text-foreground">
+          <div className="max-w-3xl mx-auto px-6 py-8">
+            <Help />
+          </div>
+        </div>
+        <Toaster position="top-right" richColors closeButton />
+      </>
+    );
+  }
+
+  return (
+    <>
+      <AccessProvider>
+        <Gate />
+      </AccessProvider>
+      <Toaster position="top-right" richColors closeButton />
+    </>
+  );
+}
+
+export default App;

@@ -10,7 +10,7 @@ import { Button } from "@/components/ui/button";
  */
 export default function Login() {
   const startLogin = () => {
-    const redirectUrl = window.location.origin + "/diagnose";
+    const redirectUrl = window.location.origin + "/";
     window.location.href =
       "https://auth.emergentagent.com/?redirect=" + encodeURIComponent(redirectUrl);
   };
@@ -26,9 +26,9 @@ export default function Login() {
             <Terminal className="h-5 w-5" strokeWidth={2.5} />
           </div>
           <div>
-            <h1 className="text-lg font-semibold tracking-tight">Mobile Build Resolver</h1>
+            <h1 className="text-lg font-semibold tracking-tight">Support Build Resolver</h1>
             <p className="mono text-[10px] uppercase tracking-widest text-muted-foreground">
-              L3 · internal support tools
+              internal support tools
             </p>
           </div>
         </div>

@@ -1,0 +1,2566 @@
+"""
+Mobile Build Resolver -- FastAPI backend proxy.
+
+All UI traffic goes: browser -> this backend -> internal endpoint / MCP.
+Secrets (REDASH_API_KEY, DEPLOYER_URL, MCP tokens, ...) stay server-side.
+"""
+from __future__ import annotations
+
+import asyncio
+import httpx
+import io
+import logging
+import os
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from fastapi import APIRouter, Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
+from fastapi.responses import JSONResponse
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field
+from starlette.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+
+import redash_client
+import deployer_client
+import mcp_client
+import signing
+import kms_shell
+import auth as auth_mod
+from audit import AuditLog
+
+ROOT = Path(__file__).parent
+load_dotenv(ROOT / ".env")
+
+# --- app + db -------------------------------------------------------------
+
+client = AsyncIOMotorClient(os.environ["MONGO_URL"])
+db = client[os.environ["DB_NAME"]]
+audit = AuditLog(db)
+
+app = FastAPI(title="Mobile Build Resolver")
+
+# Auth dependency — protects every /api route except health, root, and the auth
+# endpoints themselves.
+current_user = auth_mod.make_current_user_dep(db)
+protected = Depends(current_user)
+
+# Public router = auth endpoints + health + root. No auth required.
+public_api = APIRouter(prefix="/api")
+# Protected router = everything else. Attaches the auth dependency globally.
+# --- per-tab access enforcement (Last Updated: 2026-09-01) ---
+GUARD_ADMIN_EMAILS = {"dinakrushna@emergent.sh", "rishav.k@emergent.sh", "vinish@emergent.sh"}
+
+_TAB_ROUTES = [
+    ("/env/restart", "/env-wake"), ("/env/android-build", "/env-wake"), ("/env/ios-build", "/env-wake"),
+    ("/env/kick", "/env-kick"), ("/env/bump", "/env-bump"), ("/env/hitl", "/env-hitl"),
+    ("/diagnose", "/diagnose"), ("/expo", "/expo"), ("/suprsend", "/expo"),
+    ("/identity", "/identity"), ("/keystore", "/keystore"), ("/creds", "/creds"),
+    ("/fingerprint", "/fingerprint"), ("/pem", "/pem"), ("/forkchain", "/forkchain"),
+    ("/domain", "/domain"), ("/stripe", "/stripe"), ("/dbmgr", "/dbmgr"), ("/dbcopy", "/dbmgr"),
+    ("/export", "/export"),
+]
+
+
+def _tab_for_path(path):
+    if path.startswith("/api"):
+        path = path[4:]
+    for prefix, tab in _TAB_ROUTES:
+        if path == prefix or path.startswith(prefix + "/"):
+            return tab
+    return None
+
+
+async def enforce_tab(request: Request, user=Depends(current_user)):
+    tab = _tab_for_path(request.url.path)
+    if tab is None:
+        return
+    email = (getattr(user, "email", "") or "").lower()
+    if email in GUARD_ADMIN_EMAILS:
+        return
+    doc = await db.tool_access.find_one({"_id": email})
+    if doc and doc.get("status") == "approved" and tab in (doc.get("allowed_tabs") or []):
+        return
+    raise HTTPException(status_code=403, detail="You do not have access to this tool. Ask an admin to grant it.")
+
+
+api = APIRouter(prefix="/api", dependencies=[protected, Depends(enforce_tab)])
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("mbr")
+
+
+# --- redaction helpers ----------------------------------------------------
+
+_MASKED = "•" * 8
+
+_SENSITIVE_KEYS = {
+    "keystore_password", "fastlane_session", "api_key_issuer_id",
+    "profile_base64", "keystore_base64", "p8_base64", "kms_blob",
+    "private_key", "cert", "certificate_body",
+}
+
+
+def redact_row(row: dict) -> dict:
+    """Never render raw creds. Replace sensitive values with a masked placeholder
+    but keep a boolean flag so the UI can show 'present / missing'."""
+    out: dict[str, Any] = {}
+    for k, v in row.items():
+        if k in _SENSITIVE_KEYS:
+            out[k] = {"present": bool(v), "masked": _MASKED if v else None}
+        else:
+            out[k] = v
+    return out
+
+
+def redact_rows(rows: list[dict]) -> list[dict]:
+    return [redact_row(r) for r in rows]
+
+
+# --- request models -------------------------------------------------------
+
+class JobBody(BaseModel):
+    job_id: str
+    operator: str | None = None
+
+
+class DiagnoseBody(BaseModel):
+    job_id: str
+    app_id: str | None = None
+    package_name: str | None = None
+
+
+class ExpoLookupBody(BaseModel):
+    app_id: str | None = None
+    job_id: str | None = None
+    expo_id: str | None = None
+
+
+class IdentityIosBody(BaseModel):
+    job_id: str
+    app_name: str | None = None
+    bundle_id: str | None = None
+    operator: str | None = None
+
+
+class IdentityAndroidBody(BaseModel):
+    job_id: str
+    app_name: str | None = None
+    package_name: str | None = None
+    operator: str | None = None
+
+
+class ClearAscBody(BaseModel):
+    job_id: str
+    operator: str | None = None
+    batch: bool = False  # if true, run for every job sharing the itc_team_id
+
+
+class TestflightRetryBody(BaseModel):
+    job_id: str
+    operator: str | None = None
+
+
+class ExpoBuildActionBody(BaseModel):
+    app_id: str | None = None
+    job_id: str | None = None
+    profile: str | None = None
+    platform: str | None = None
+    operator: str | None = None
+
+
+class FingerprintUrlBody(BaseModel):
+    url: str
+
+
+class ExtractUploadKeyBody(BaseModel):
+    job_id: str
+    operator: str | None = None
+
+
+class ForceRegenBody(BaseModel):
+    job_id: str
+    platform: str  # "ios" | "android"
+    operator: str | None = None
+
+
+class McpToolBody(BaseModel):
+    tool: str
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
+# --- queries (kept in one place so the UI can display them) ---------------
+
+Q_IOS_CFG = """
+SELECT bundle_id, team_id, api_key_id, api_key_issuer_id, testflight_status,
+       testflight_error, certificate_expires_at, profile_expires_at,
+       fastlane_session, apple_id, itc_team_id, user_id, job_id
+FROM ios_app_configs
+WHERE job_id = '{{ job }}'
+""".strip()
+
+Q_ANDROID_CFG = """
+SELECT id, job_id, user_id, package_name, keystore_path, key_alias,
+       expo_project_id, apk_url, aab_url, keystore_password, created_at
+FROM android_app_configs
+WHERE job_id = '{{ job }}'
+""".strip()
+
+Q_APP_BY_ID = """
+SELECT a.name AS app, a.id AS app_id, a.expo_id, ea.owner AS expo_owner
+FROM apps a
+LEFT JOIN expo_accounts ea ON ea.id = a.expo_id
+WHERE a.id = '{{ app_id }}'
+""".strip()
+
+Q_APP_BY_JOB_IOS = "SELECT app_id FROM ios_app_configs WHERE job_id = '{{ job }}'"
+Q_APP_BY_JOB_ANDROID = "SELECT app_id FROM android_app_configs WHERE job_id = '{{ job }}'"
+
+Q_APP_VIA_PIPELINE = """
+SELECT a.name AS app, a.id AS app_id, a.expo_id, ea.owner AS expo_owner
+FROM apps a
+LEFT JOIN expo_accounts ea ON ea.id = a.expo_id
+WHERE a.name IN (
+    SELECT DISTINCT deployment_name FROM pipeline_runs
+    WHERE app = (SELECT name FROM apps WHERE id = '{{ job }}')
+      AND deployment_name IS NOT NULL
+)
+ORDER BY (a.expo_id IS NOT NULL) DESC
+LIMIT 1
+""".strip()
+
+Q_FINGERPRINT_UNION = """
+SELECT 'v3' AS src, job_id, app_name, package_name, key_alias, keystore_path, apk_url, aab_url
+FROM android_app_configs_v3 WHERE job_id = '{{ job }}'
+UNION ALL
+SELECT 'v1' AS src, job_id, app_name, package_name, key_alias, keystore_path, apk_url, aab_url
+FROM android_app_configs WHERE job_id = '{{ job }}'
+""".strip()
+
+Q_ASC_BATCH = """
+SELECT job_id
+FROM ios_app_configs
+WHERE user_id = '{{ u }}'
+  AND itc_team_id = '{{ t }}'
+  AND api_key_id IS NOT NULL
+""".strip()
+
+Q_KEYSTORE_PW = "SELECT keystore_password FROM android_app_configs WHERE job_id = '{{ job }}'"
+
+Q_FORCE_REGEN_IOS = "UPDATE ios_app_configs SET profile_base64 = '' WHERE job_id = '{{ job }}'"
+Q_FORCE_REGEN_ANDROID = "UPDATE android_app_configs SET keystore_path = NULL WHERE job_id = '{{ job }}'"
+
+
+# --- diagnose -------------------------------------------------------------
+
+def _first(rows: list[dict]) -> dict | None:
+    return rows[0] if rows else None
+
+
+def _build_banner(ios: dict | None, android: dict | None) -> dict:
+    """Compose the top diagnosis banner from raw config rows."""
+    platform = "unknown"
+    if ios and android:
+        platform = "iOS + Android"
+    elif ios:
+        platform = "iOS"
+    elif android:
+        platform = "Android"
+
+    is_eas = bool(android and android.get("expo_project_id"))
+
+    flags: list[dict[str, str]] = []
+    if ios:
+        if ios.get("testflight_status") == "failed":
+            flags.append({"severity": "red",
+                          "label": f"TestFlight failed: {ios.get('testflight_error') or 'no error text'}"})
+        if not ios.get("fastlane_session"):
+            flags.append({"severity": "amber", "label": "fastlane_session is NULL"})
+        if not ios.get("api_key_id"):
+            flags.append({"severity": "amber", "label": "ASC api_key_id missing"})
+    if android:
+        if not android.get("keystore_path"):
+            flags.append({"severity": "amber", "label": "keystore_path is NULL (will be regenerated)"})
+        if not android.get("aab_url") and not android.get("apk_url"):
+            flags.append({"severity": "amber", "label": "No AAB/APK URL yet -- build never completed"})
+
+    if not flags and (ios or android):
+        flags.append({"severity": "green", "label": "No red flags in the DB row"})
+
+    return {
+        "platform": platform,
+        "is_eas": is_eas,
+        "flags": flags,
+        "found": bool(ios or android),
+    }
+
+
+@api.post("/diagnose")
+async def diagnose(body: DiagnoseBody):
+    ios_res = await redash_client.execute(Q_IOS_CFG, {"job": body.job_id})
+    and_res = await redash_client.execute(Q_ANDROID_CFG, {"job": body.job_id})
+
+    ios_row = _first(ios_res.get("rows", []))
+    and_row = _first(and_res.get("rows", []))
+
+    # user_id used by keystore endpoints comes from the android row's user_id.
+    resolved_user_id = None
+    if and_row and and_row.get("user_id"):
+        resolved_user_id = str(and_row["user_id"])
+    elif ios_row and ios_row.get("user_id"):
+        resolved_user_id = str(ios_row["user_id"])
+
+    ios_masked = redact_row(ios_row) if ios_row else None
+    and_masked = redact_row(and_row) if and_row else None
+
+    return {
+        "banner": _build_banner(ios_row, and_row),
+        "ios": {
+            "row": ios_masked,
+            "query": Q_IOS_CFG,
+            "ok": ios_res["ok"],
+            "error": ios_res.get("error"),
+        },
+        "android": {
+            "row": and_masked,
+            "query": Q_ANDROID_CFG,
+            "ok": and_res["ok"],
+            "error": and_res.get("error"),
+        },
+        "resolved_user_id": resolved_user_id,
+    }
+
+
+Q_BUILD_FAILURE = """
+SELECT pr.id AS pipeline_run_id, pr.app, pr.type, pr.status AS run_status,
+       pr.cloud_build_id, pr.eas_build_id, pr.created_at,
+       s.name AS step, s.status AS step_status, s.error AS step_error, s.logs AS step_logs
+FROM pipeline_runs pr
+JOIN pipeline_run_steps s ON s.pipeline_run_id = pr.id
+WHERE pr.app = (SELECT name FROM apps WHERE id = \'{{ job }}\')
+  AND s.status = \'failed\'
+ORDER BY pr.created_at DESC NULLS LAST
+LIMIT 10
+""".strip()
+
+
+Q_BUILD_FAILURE_BY_USER = """
+SELECT pr.id AS pipeline_run_id, pr.app, pr.type, pr.status AS run_status,
+       pr.cloud_build_id, pr.eas_build_id, pr.created_at,
+       s.name AS step, s.status AS step_status, s.error AS step_error, s.logs AS step_logs
+FROM pipeline_runs pr
+JOIN pipeline_run_steps s ON s.pipeline_run_id = pr.id
+WHERE pr.user_id = COALESCE(
+        (SELECT user_id FROM android_app_configs WHERE job_id = \'{{ job }}\' LIMIT 1),
+        (SELECT user_id FROM ios_app_configs WHERE job_id = \'{{ job }}\' LIMIT 1))
+  AND pr.type IN (\'android_build\', \'ios_build\')
+  AND s.status = \'failed\'
+ORDER BY pr.created_at DESC NULLS LAST
+LIMIT 10
+""".strip()
+
+
+Q_LATEST_BUILDS_BY_APP = """
+SELECT DISTINCT ON (pr.type) pr.type, pr.status, pr.created_at
+FROM pipeline_runs pr
+WHERE pr.app = '{{ app }}'
+  AND pr.type IN ('android_build', 'ios_build')
+ORDER BY pr.type, pr.created_at DESC NULLS LAST
+""".strip()
+
+
+def _extract_error_lines(logs):
+    """Pull the human-meaningful error lines out of a raw EAS/Gradle log tail,
+    dropping the JSON phase-marker noise. Purely parsed from the real log -- nothing
+    hard-coded."""
+    out = []
+    for ln in (logs or "").split("\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        low = ln.lower()
+        if "error:" not in low and "gradle build failed" not in low and "build failed:" not in low:
+            continue
+        if ln.startswith("[EAS_LOG] {") or '"level"' in ln:
+            continue  # JSON marker line -- skip the noise
+        ln = ln.replace("[EAS_LOG] ", "").strip()
+        if ": error:" in ln:
+            ln = "error:" + ln.split(": error:", 1)[1]
+        if ln not in out:
+            out.append(ln)
+        if len(out) >= 6:
+            break
+    return out
+
+
+@api.post("/diagnose/logs")
+async def diagnose_logs(body: JobBody):
+    """Why did the build fail? Resolve the job's app, then read the real failed-step
+    error + EAS/Gradle log tail straight from Redash pipeline_run_steps (reliable),
+    instead of the flaky deployer MCP (which needed a cloud_build_id and timed out)."""
+    resolved_via = "apps.id"
+    q = await redash_client.execute(Q_BUILD_FAILURE, {"job": body.job_id})
+    rows = q.get("rows", []) or []
+    if not rows:
+        # This job_id is a build-config job whose deployment slug differs from
+        # apps.id (e.g. app "Fyndit" deploys under slug "community-paws"). Resolve
+        # the owner from the config tables and pull their failed mobile builds.
+        resolved_via = "user_id"
+        q = await redash_client.execute(Q_BUILD_FAILURE_BY_USER, {"job": body.job_id})
+        rows = q.get("rows", []) or []
+    if not rows:
+        return {"found": False, "error": q.get("error"),
+                "note": "No failed build steps found for this job "
+                        "(the build succeeded, or no mobile build ran).",
+                "failures": []}
+
+    # Group identical failures and keep ONLY the real "why it failed" signal:
+    # the parsed step error + the meaningful error lines pulled from the live log.
+    groups = {}
+    for r in rows:
+        key = (r.get("type"), r.get("step"), (r.get("step_error") or "").strip())
+        g = groups.get(key)
+        if g is None:
+            g = {
+                "platform": r.get("type"),
+                "step": r.get("step"),
+                "attempts": 0,
+                "last_failed_at": r.get("created_at"),
+                "why": (r.get("step_error") or "").strip() or None,
+                "error_lines": _extract_error_lines(r.get("step_logs") or ""),
+            }
+            groups[key] = g
+        g["attempts"] += 1
+        if not g["error_lines"]:
+            g["error_lines"] = _extract_error_lines(r.get("step_logs") or "")
+
+    reasons = list(groups.values())
+
+    # Option B: report the LATEST build per platform so stale failures are clearly
+    # flagged as resolved history instead of looking like current breakage.
+    app_slug = rows[0].get("app")
+    lb = await redash_client.execute(Q_LATEST_BUILDS_BY_APP, {"app": app_slug})
+    latest = {}
+    for r in (lb.get("rows", []) or []):
+        latest[r.get("type")] = {"status": r.get("status"), "at": r.get("created_at")}
+
+    for g in reasons:
+        info = latest.get(g["platform"]) or {}
+        g["latest_build_status"] = info.get("status")
+        # ISO-8601 UTC strings compare lexicographically
+        g["resolved"] = bool(
+            info.get("status") == "success"
+            and info.get("at") and g.get("last_failed_at")
+            and info["at"] > g["last_failed_at"]
+        )
+
+    # Keep ONLY currently-failing platforms. If a platform's LATEST build
+    # succeeded, its old failures are resolved history -> drop them entirely.
+    current = [g for g in reasons if not g.get("resolved")]
+
+    if not current:
+        # Every platform's latest build succeeded -> show nothing but "success".
+        return {
+            "found": False,
+            "app": app_slug,
+            "status": "success",
+            "note": "Latest build succeeded - no current build failures.",
+            "latest_builds": latest,
+        }
+
+    # strip the internal resolved/latest fields from the reasons we surface
+    for g in current:
+        g.pop("resolved", None)
+        g.pop("latest_build_status", None)
+
+    failing = ", ".join(g["platform"] for g in current)
+    return {
+        "found": True,
+        "app": app_slug,
+        "resolved_via": resolved_via,
+        "status_note": "Current build failure on: " + failing,
+        "latest_builds": latest,
+        "reasons": current,
+    }
+
+
+# --- find expo account ----------------------------------------------------
+
+Q_EXPO_BY_USER = """
+SELECT a.id AS app_id, a.name AS app, a.expo_id, ea.owner AS expo_owner
+FROM apps a
+JOIN expo_accounts ea ON ea.id = a.expo_id
+WHERE a.user_id = COALESCE(
+        (SELECT user_id FROM apps WHERE id = \'{{ job }}\'),
+        (SELECT user_id FROM android_app_configs WHERE job_id = \'{{ job }}\' LIMIT 1),
+        (SELECT user_id FROM ios_app_configs WHERE job_id = \'{{ job }}\' LIMIT 1))
+ORDER BY a.updated_at DESC NULLS LAST
+LIMIT 20
+""".strip()
+
+Q_JOB_IDENTIFIERS = """
+SELECT app_name, package_name AS pkg FROM android_app_configs WHERE job_id = \'{{ job }}\'
+UNION ALL
+SELECT app_name, bundle_id AS pkg FROM ios_app_configs WHERE job_id = \'{{ job }}\'
+""".strip()
+
+
+async def _true_owner_by_project(job_id, prefer_expo_id=None):
+    """Authoritative account resolution. Find which Expo account actually owns the
+    job's EAS project (expo_project_id) using stored robot tokens. Returns a row
+    {app, expo_id, expo_owner, expo_project_id} or None (no build / external)."""
+    pr = await redash_client.execute(Q_EXPO_PROJECT_ID, {"job": job_id})
+    prow = _first(pr.get("rows", []))
+    project_id = prow.get("expo_project_id") if prow else None
+    if not project_id:
+        return None
+
+    def _row(acc, res):
+        eapp = res.get("expo_app") or {}
+        return {"app": eapp.get("slug") or eapp.get("name"),
+                "app_id": None, "expo_id": acc.get("id"),
+                "expo_owner": acc.get("owner"), "expo_project_id": project_id}
+
+    # fast path: the DB-preferred account
+    if prefer_expo_id:
+        tr = await redash_client.execute(Q_EXPO_TOKEN, {"expo_id": prefer_expo_id})
+        trow = _first(tr.get("rows", []))
+        if trow and trow.get("token"):
+            res = await _expo_app_builds(trow["token"], project_id)
+            if res.get("found"):
+                return _row({"id": prefer_expo_id, "owner": trow.get("owner")}, res)
+
+    # probe every stored account
+    allr = await redash_client.execute(
+        "SELECT id, owner, token FROM expo_accounts WHERE token IS NOT NULL")
+    accts = [a for a in (allr.get("rows", []) or [])
+             if a.get("token") and a.get("id") != prefer_expo_id][:80]
+    sem = asyncio.Semaphore(12)
+
+    async def probe(a):
+        async with sem:
+            r = await _expo_app_builds(a["token"], project_id)
+        return (a, r) if r.get("found") else None
+
+    hits = [h for h in await asyncio.gather(*[probe(a) for a in accts]) if h]
+    if hits:
+        a, res = hits[0]
+        return _row(a, res)
+    return None
+
+
+@api.post("/expo/lookup")
+async def expo_lookup(body: ExpoLookupBody):
+    if not body.app_id and not body.job_id:
+        raise HTTPException(400, "Provide app_id or job_id")
+
+    # apps.id IS the job id -- resolve directly, no config indirection.
+    app_id = body.app_id or body.job_id
+    resolved_from = None if body.app_id else "apps.id"
+
+    q = await redash_client.execute(Q_APP_BY_ID, {"app_id": app_id})
+    row = _first(q.get("rows", []))
+
+    # Authoritative: if this job actually has a mobile build (an EAS project),
+    # resolve the account that really owns it on Expo -- this overrides any DB
+    # lineage/owner guess so a job_id always maps to its build's true account.
+    if body.job_id:
+        _true = await _true_owner_by_project(
+            body.job_id, prefer_expo_id=(row.get("expo_id") if row else None))
+        if _true:
+            return {"found": True,
+                    "resolved_from": "expo project owner (live)",
+                    "app_id": app_id,
+                    "row": _true,
+                    "empty_expo": False,
+                    "note": "Resolved from the build's actual EAS project on Expo "
+                            "(authoritative -- overrides DB lineage guesses)."}
+
+    # Exact resolution via fork lineage: if this job's own app has no Expo
+    # account, inherit from the NEAREST ancestor (parent/clone) app that does.
+    # This is the account the build actually descends from.
+    if (not row or not row.get("expo_id")) and body.job_id:
+        up = await redash_client.execute(Q_FORKCHAIN_UP, {"job": body.job_id},
+                                         data_source_id=JOBS_DS_ID)
+        anc = [r for r in (up.get("rows", []) or []) if r.get("id")]
+        ids = [r["id"] for r in anc
+               if re.fullmatch(r"[0-9a-fA-F-]{36}", str(r.get("id") or ""))]
+        if ids:
+            inlist = ", ".join("'" + i + "'" for i in ids)
+            aq = await redash_client.execute(
+                "SELECT a.name AS app, a.id AS app_id, a.expo_id, "
+                "ea.owner AS expo_owner FROM apps a "
+                "JOIN expo_accounts ea ON ea.id = a.expo_id "
+                "WHERE a.id IN (" + inlist + ")")
+            got = {r.get("app_id"): r for r in (aq.get("rows", []) or [])}
+            for r in anc:                # nearest ancestor first (depth order)
+                if r["id"] in got:
+                    row = got[r["id"]]
+                    resolved_from = ("apps.id" if r["id"] == app_id
+                                     else "fork lineage (ancestor app)")
+                    break
+
+    # Fallback: the id matched no apps row -> resolve the slug via pipeline_runs.
+    if not row and body.job_id:
+        q2 = await redash_client.execute(Q_APP_VIA_PIPELINE, {"job": body.job_id})
+        row = _first(q2.get("rows", []))
+        if row:
+            resolved_from = "pipeline_runs.deployment_name"
+
+    # Fallback 2: a build-config job whose id is not an apps.id. Resolve via the
+    # job owner's Expo-linked apps. A user may own several -> rank by name match
+    # against the job's app_name / package and also return all candidates.
+    if (not row or not row.get("expo_id")) and body.job_id:
+        uq = await redash_client.execute(Q_EXPO_BY_USER, {"job": body.job_id})
+        cands = uq.get("rows", []) or []
+        if cands:
+            idq = await redash_client.execute(Q_JOB_IDENTIFIERS, {"job": body.job_id})
+            tokens = set()
+            for ir in (idq.get("rows", []) or []):
+                for v in (ir.get("app_name"), ir.get("pkg")):
+                    for t in re.split(r"[^a-z0-9]+", (v or "").lower()):
+                        if len(t) >= 3:
+                            tokens.add(t)
+
+            def _score(nm):
+                nm = (nm or "").lower()
+                return sum(1 for t in tokens if t in nm)
+
+            cands.sort(key=lambda c: _score(c.get("app")), reverse=True)
+            best = None
+            if cands and (len(cands) == 1 or _score(cands[0].get("app")) > 0):
+                best = cands[0]
+            return {
+                "found": True,
+                "resolved_from": "user_id (owner account)",
+                "app_id": app_id,
+                "direct_app": (row.get("app") if row else None),
+                "row": best,
+                "candidates": cands,
+                "note": ("Resolved via the job owner - this user owns multiple "
+                        "Expo-linked apps. 'row' is the best name match; "
+                        "'candidates' lists all, verify which app is the right one."),
+                "empty_expo": bool(best and not best.get("expo_id")),
+            }
+
+    if not row:
+        return {"found": False,
+                "reason": "no apps row for that id and no pipeline_runs match",
+                "app_id": app_id, "resolved_from": None}
+
+    return {
+        "found": True,
+        "app_id": app_id,
+        "resolved_from": resolved_from,
+        "row": row,
+        "query": Q_APP_BY_ID,
+        "empty_expo": bool(not row.get("expo_id")),
+    }
+
+
+Q_EXPO_PROJECT_ID = """
+SELECT expo_project_id FROM android_app_configs
+WHERE job_id = \'{{ job }}\' AND expo_project_id IS NOT NULL
+UNION ALL
+SELECT expo_project_id FROM ios_app_configs
+WHERE job_id = \'{{ job }}\' AND expo_project_id IS NOT NULL
+LIMIT 1
+""".strip()
+
+Q_EXPO_TOKEN = "SELECT owner, token FROM expo_accounts WHERE id = \'{{ expo_id }}\'"
+
+
+async def _expo_app_builds(token, project_id):
+    """Query live Expo (EAS) for a project's builds using the resolved account's
+    own robot token. Returns the app owner + recent builds, or a mismatch note."""
+    q = ("query($id:String!){ app{ byId(appId:$id){ id name slug "
+         "ownerAccount{name} builds(limit:8,offset:0){ id platform status "
+         "createdAt appVersion } } } }")
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(
+                "https://api.expo.dev/graphql",
+                headers={"Authorization": "Bearer " + token,
+                         "Content-Type": "application/json"},
+                json={"query": q, "variables": {"id": project_id}})
+    except httpx.HTTPError as e:
+        return {"found": False, "error": "Expo unreachable: " + str(e)}
+    try:
+        data = r.json()
+    except Exception:
+        return {"found": False, "error": "non-JSON from Expo", "raw": r.text[:400]}
+    if data.get("errors"):
+        return {"found": False, "errors": data["errors"]}
+    app = ((data.get("data") or {}).get("app") or {}).get("byId")
+    if not app:
+        return {"found": False,
+                "note": "The resolved account's token cannot see this EAS project "
+                        "-- the build may live under a different Expo account."}
+    return {"found": True,
+            "expo_app": {"name": app.get("name"), "slug": app.get("slug"),
+                         "owner": (app.get("ownerAccount") or {}).get("name")},
+            "builds": app.get("builds") or []}
+
+
+@api.post("/expo/builds")
+async def expo_builds(body: ExpoLookupBody):
+    """Authoritative cross-check. Take the job's EAS project (expo_project_id) and
+    ask Expo who really owns it: first try the DB-resolved account's own token; if
+    that account cannot read it, probe every stored account token to find the true
+    owner. Expo is the source of truth, so this catches a wrong DB resolution."""
+    if not body.job_id:
+        return {"ok": False, "error": "job_id required -- run the lookup first."}
+    pr = await redash_client.execute(Q_EXPO_PROJECT_ID, {"job": body.job_id})
+    prow = _first(pr.get("rows", []))
+    project_id = prow.get("expo_project_id") if prow else None
+    if not project_id:
+        return {"ok": False,
+                "error": "This job's config has no expo_project_id (no EAS project yet)."}
+
+    resolved_owner = None
+    # 1) fast path: the DB-resolved account
+    if body.expo_id:
+        tr = await redash_client.execute(Q_EXPO_TOKEN, {"expo_id": body.expo_id})
+        trow = _first(tr.get("rows", []))
+        if trow and trow.get("token"):
+            resolved_owner = trow.get("owner")
+            res = await _expo_app_builds(trow["token"], project_id)
+            if res.get("found"):
+                res.update({"ok": True, "expo_project_id": project_id, "matched": True,
+                            "note": "Confirmed on Expo: the resolved account owns this "
+                                    "build's EAS project."})
+                return res
+
+    # 2) resolved account did not own it -> find the true owner across all accounts
+    allr = await redash_client.execute(
+        "SELECT id, owner, token FROM expo_accounts WHERE token IS NOT NULL")
+    accts = [a for a in (allr.get("rows", []) or [])
+             if a.get("token") and a.get("id") != body.expo_id][:80]
+    sem = asyncio.Semaphore(12)
+
+    async def probe(a):
+        async with sem:
+            r = await _expo_app_builds(a["token"], project_id)
+        return (a, r) if r.get("found") else None
+
+    hits = [h for h in await asyncio.gather(*[probe(a) for a in accts]) if h]
+    if hits:
+        a, r = hits[0]
+        r.update({"ok": True, "expo_project_id": project_id, "matched": False,
+                  "true_owner": a.get("owner"),
+                  "note": ("MISMATCH: the DB-resolved account ("
+                           + str(resolved_owner) + ") does NOT own this build's EAS "
+                           "project. It actually lives under Expo account '"
+                           + str(a.get("owner")) + "'.")})
+        return r
+
+    return {"ok": True, "found": False, "expo_project_id": project_id,
+            "note": ("No stored Expo account can read this EAS project. It may live "
+                     "under an external/customer Expo account (not one of ours), or "
+                     "resolved account " + str(resolved_owner) + " lacks access.")}
+
+
+# --- fix identity (destructive, X-Internal-User) --------------------------
+
+@api.post("/identity/ios")
+async def set_ios_identity(body: IdentityIosBody):
+    payload = {k: v for k, v in
+               {"app_name": body.app_name, "bundle_id": body.bundle_id}.items()
+               if v}
+    if not payload:
+        raise HTTPException(400, "Provide at least one of app_name / bundle_id")
+    r = await deployer_client.ios_set_identity(body.job_id, payload)
+    await audit.log(operator=body.operator or "", action="ios_set_identity",
+                    job_id=body.job_id, status_code=r.get("status_code"),
+                    details={"payload": payload})
+    return r
+
+
+@api.post("/identity/android")
+async def set_android_identity(body: IdentityAndroidBody):
+    payload = {k: v for k, v in
+               {"app_name": body.app_name, "package_name": body.package_name}.items()
+               if v}
+    if not payload:
+        raise HTTPException(400, "Provide at least one of app_name / package_name")
+    r = await deployer_client.android_set_identity(body.job_id, payload)
+    await audit.log(operator=body.operator or "", action="android_set_identity",
+                    job_id=body.job_id, status_code=r.get("status_code"),
+                    details={"payload": payload})
+    return r
+
+
+# --- keystore manager -----------------------------------------------------
+
+def _sanitize_uid(user_id: str) -> str:
+    # X-User-ID must be a plain identifier, no header injection.
+    if not re.fullmatch(r"[A-Za-z0-9_\-\.]{1,80}", user_id or ""):
+        raise HTTPException(400, "Invalid user_id (expected simple identifier)")
+    return user_id
+
+
+@api.get("/keystore/{job_id}")
+async def keystore_get(job_id: str, user_id: str):
+    _sanitize_uid(user_id)
+    r = await deployer_client.android_keystore_get(job_id, user_id)
+    return r
+
+
+@api.post("/keystore/{job_id}")
+async def keystore_upload(
+    job_id: str,
+    user_id: str = Form(...),
+    operator: str = Form(""),
+    pem_file: UploadFile = File(...),
+):
+    _sanitize_uid(user_id)
+    name = pem_file.filename or "upload.bin"
+    lname = name.lower()
+
+    if lname.endswith(".der"):
+        raise HTTPException(400, "DER files are public certificates only and cannot sign. "
+                                 "Please upload the ORIGINAL keystore (.jks, .pem, or .p12).")
+
+    content = await pem_file.read()
+
+    # convert .jks/.p12 -> .pem before uploading
+    converted_note = None
+    if lname.endswith(".jks") or lname.endswith(".p12"):
+        conv = _convert_keystore_to_pem(content, lname)
+        if not conv["ok"]:
+            raise HTTPException(400, f"Failed to convert {lname} -> PEM: {conv['error']}")
+        content = conv["pem"].encode()
+        name = re.sub(r"\.(jks|p12)$", ".pem", name, flags=re.I)
+        converted_note = f"Converted {lname} -> PEM before upload"
+
+    r = await deployer_client.android_keystore_upload(
+        job_id, user_id, name, content, "application/x-pem-file")
+
+    # Auto-fingerprint on success -- pull fresh row and compute
+    fp = None
+    if r.get("status_code") in (200, 201, 204):
+        # try to compute fingerprint from the just-uploaded pem
+        try:
+            # We can't extract pkcs7 from a bare PEM public cert -- but we can
+            # hash the DER cert. This is a best-effort convenience.
+            from cryptography import x509
+            from cryptography.hazmat.primitives import hashes, serialization
+            cert = x509.load_pem_x509_certificate(content)
+            der = cert.public_bytes(serialization.Encoding.DER)
+            import hashlib
+            fp = {
+                "sha1": ":".join(f"{b:02X}" for b in hashlib.sha1(der).digest()),
+                "sha256": ":".join(f"{b:02X}" for b in hashlib.sha256(der).digest()),
+                "subject": cert.subject.rfc4514_string(),
+                "source": "uploaded PEM",
+            }
+        except Exception as e:  # pragma: no cover
+            fp = {"error": f"Could not parse uploaded PEM for fingerprint: {e}"}
+
+    await audit.log(operator=operator, action="keystore_upload",
+                    job_id=job_id, status_code=r.get("status_code"),
+                    details={"filename": name, "converted": converted_note})
+
+    return {**r, "converted_note": converted_note, "auto_fingerprint": fp}
+
+
+def _convert_keystore_to_pem(content: bytes, lname: str) -> dict:
+    """
+    .jks -> .p12 -> .pem via keytool + openssl.
+    .p12 -> .pem via openssl.
+
+    Requires `keytool` on PATH for .jks. If missing, returns ok=False with a
+    friendly error explaining the operator must convert to .pem locally first.
+    """
+    import shutil as _sh
+    if lname.endswith(".jks") and not _sh.which("keytool"):
+        return {"ok": False, "pem": None,
+                "error": "keytool (JDK) not present -- convert .jks -> .pem locally "
+                         "with `keytool -importkeystore` then re-upload."}
+    if not _sh.which("openssl"):
+        return {"ok": False, "pem": None, "error": "openssl not present on backend"}
+
+    tmp = tempfile.mkdtemp(prefix="mbr-conv-")
+    try:
+        src = os.path.join(tmp, "in" + os.path.splitext(lname)[1])
+        with open(src, "wb") as f:
+            f.write(content)
+
+        if lname.endswith(".jks"):
+            p12 = os.path.join(tmp, "in.p12")
+            # No password known here -- try with -srcstorepass=<blank>. In practice
+            # the operator will paste the password if needed; we surface stderr.
+            r = subprocess.run(
+                ["keytool", "-importkeystore", "-srckeystore", src,
+                 "-destkeystore", p12, "-deststoretype", "PKCS12",
+                 "-noprompt"],
+                capture_output=True, timeout=60,
+            )
+            if r.returncode != 0:
+                return {"ok": False, "pem": None, "error": r.stderr.decode()[:1000]}
+            src = p12
+
+        # .p12 -> .pem
+        r = subprocess.run(
+            ["openssl", "pkcs12", "-in", src, "-passin", "pass:", "-nokeys", "-clcerts"],
+            capture_output=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return {"ok": False, "pem": None,
+                    "error": "openssl pkcs12 failed (probably needs a password). "
+                             "Convert to .pem locally first."}
+        r2 = subprocess.run(
+            ["openssl", "x509", "-outform", "PEM"],
+            input=r.stdout, capture_output=True, timeout=15,
+        )
+        if r2.returncode != 0:
+            return {"ok": False, "pem": None, "error": r2.stderr.decode()[:1000]}
+        return {"ok": True, "pem": r2.stdout.decode(), "error": None}
+    finally:
+        try:
+            import shutil as _sh2
+            _sh2.rmtree(tmp, ignore_errors=True)
+        except Exception:
+            pass
+
+
+# --- creds & retry (iOS) --------------------------------------------------
+
+@api.post("/creds/clear-asc/preview")
+async def clear_asc_preview(body: JobBody):
+    """Show every job that shares the same (user_id, itc_team_id) -- these will
+    also be cleared if the operator opts into batch mode."""
+    r = await redash_client.execute(Q_IOS_CFG, {"job": body.job_id})
+    row = _first(r.get("rows", []))
+    if not row:
+        return {"found": False, "jobs": [], "user_id": None, "itc_team_id": None}
+    u, t = row.get("user_id"), row.get("itc_team_id")
+    if not u or not t:
+        return {"found": True, "jobs": [], "user_id": u, "itc_team_id": t,
+                "reason": "row missing user_id or itc_team_id"}
+    r2 = await redash_client.execute(Q_ASC_BATCH, {"u": u, "t": t})
+    return {
+        "found": True,
+        "user_id": u,
+        "itc_team_id": t,
+        "jobs": [str(x["job_id"]) for x in (r2.get("rows") or []) if x.get("job_id")],
+        "query": Q_ASC_BATCH,
+    }
+
+
+@api.post("/creds/clear-asc")
+async def clear_asc(body: ClearAscBody):
+    targets = [body.job_id]
+    if body.batch:
+        prev = await clear_asc_preview(JobBody(job_id=body.job_id))
+        targets = list({*targets, *prev.get("jobs", [])})
+
+    results = []
+    for jid in targets:
+        r = await deployer_client.ios_clear_asc(jid)
+        results.append({"job_id": jid, **r})
+        await audit.log(operator=body.operator or "", action="ios_clear_asc",
+                        job_id=jid, status_code=r.get("status_code"),
+                        details={"batch": body.batch, "root_job": body.job_id})
+    return {"batch": body.batch, "count": len(results), "results": results}
+
+
+@api.post("/creds/testflight-retry")
+async def testflight_retry(body: TestflightRetryBody):
+    r = await deployer_client.ios_testflight_retry(body.job_id)
+    await audit.log(operator=body.operator or "", action="ios_testflight_retry",
+                    job_id=body.job_id, status_code=r.get("status_code"))
+    return r
+
+
+@api.post("/creds/expo-rebuild")
+async def expo_rebuild(body: ExpoBuildActionBody):
+    args = {k: v for k, v in {
+        "appId": body.app_id, "platform": body.platform,
+        "profile": body.profile}.items() if v}
+    r = await mcp_client.expo_tool("build_run", args)
+    await audit.log(operator=body.operator or "", action="expo_build_run",
+                    job_id=body.job_id, status_code=r.get("status"),
+                    details={"args": args})
+    return r
+
+
+# --- signing fingerprint --------------------------------------------------
+
+@api.post("/token/test")
+async def token_test():
+    """Self-test the service-account token fetch. Never leaks the token."""
+    import token_manager
+    r = await token_manager.get_token()
+    if not r.get("ok"):
+        return {"ok": False, "error": r.get("error")}
+    tok = r.get("access_token") or ""
+    return {"ok": True, "cached": r.get("cached"),
+            "expires_at": r.get("expires_at"),
+            "token_preview": (tok[:12] + "...") if tok else None}
+
+
+# --- L2 env actions (agent-service, via self-fetched token) ----------------
+
+class EnvActionBody(BaseModel):
+    job_id: str | None = None
+    env_key: str | None = None
+    operator: str | None = None
+    build_type: str | None = "both"
+    machine_type: str | None = "large"
+    model: str | None = None
+
+
+@api.post("/env/restart")
+async def env_restart(body: EnvActionBody):
+    """Wake / force-restart a preview environment (recreates the container)."""
+    import token_manager
+    r = await token_manager.agent_call(
+        "POST", f"/jobs/v0/{body.job_id}/restart-environment?upgrade=false&source=l2_tool")
+    await audit.log(operator=body.operator or "", action="env_restart",
+                    job_id=body.job_id, status_code=r.get("status_code"))
+    return r
+
+
+@api.post("/env/android-build")
+async def env_android_build(body: EnvActionBody):
+    """Trigger a fresh Android (EAS) build via agent-service. No EXPO_MCP_TOKEN needed."""
+    import token_manager
+    r = await token_manager.agent_call(
+        "POST", f"/jobs/v0/android/build/{body.job_id}",
+        {"build_type": body.build_type or "both"})
+    await audit.log(operator=body.operator or "", action="env_android_build",
+                    job_id=body.job_id, status_code=r.get("status_code"),
+                    details={"build_type": body.build_type or "both"})
+    return r
+
+
+@api.post("/env/ios-build")
+async def env_ios_build(body: EnvActionBody):
+    """Trigger a fresh iOS (EAS) build via agent-service."""
+    import token_manager
+    r = await token_manager.agent_call("POST", f"/jobs/v0/ios/build/{body.job_id}", {})
+    await audit.log(operator=body.operator or "", action="env_ios_build",
+                    job_id=body.job_id, status_code=r.get("status_code"))
+    return r
+
+
+@api.post("/env/kick")
+async def env_kick(body: EnvActionBody):
+    """KICK: pod up but hung/zombie -> restart supervisord inside it (envcore proxy)."""
+    ek = body.env_key or body.job_id
+    if not ek:
+        raise HTTPException(400, "env_key (slug) required")
+    url = ("http://envcore.int-worker.emergentagent.com/api/v1/env/proxy/tools/mcp"
+           f"?env_key={ek}&port=8010")
+    payload = {"method": "tools/call", "params": {"name": "execute_bash",
+               "arguments": {"command": "sudo supervisorctl restart all", "timeout": 120, "cwd": None}}}
+    try:
+        async with httpx.AsyncClient(timeout=140) as c:
+            r = await c.request("POST", url, json=payload)
+        b = r.json() if "json" in r.headers.get("content-type", "") else r.text[:600]
+        res = {"ok": r.status_code < 400, "status_code": r.status_code, "body": b}
+    except Exception as e:
+        res = {"ok": False, "status_code": 0, "error": str(e)}
+    await audit.log(operator=body.operator or "", action="env_kick", job_id=ek,
+                    status_code=res.get("status_code"))
+    return res
+
+
+@api.post("/env/bump")
+async def env_bump(body: EnvActionBody):
+    """BUMP: heavy/OOM job -> raise machine type to large (then Wake to apply)."""
+    if not body.job_id:
+        raise HTTPException(400, "job_id required")
+    mt = body.machine_type or "large"
+    try:
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.request("POST", "https://ea.int.apis.emergentagent.com/support/machine-type/increase",
+                                json={"entity_id": body.job_id, "machine_type": mt})
+        b = r.json() if "json" in r.headers.get("content-type", "") else r.text[:400]
+        res = {"ok": r.status_code < 400, "status_code": r.status_code, "body": b}
+    except Exception as e:
+        res = {"ok": False, "status_code": 0, "error": str(e)}
+    await audit.log(operator=body.operator or "", action="env_bump", job_id=body.job_id,
+                    status_code=res.get("status_code"), details={"machine_type": mt})
+    res["note"] = "If bumped, run Wake / Restart to apply the new size."
+    return res
+
+
+@api.post("/env/pause")
+async def env_pause(body: EnvActionBody):
+    """PAUSE: pause a stuck running env (public edge, token) before Wake."""
+    if not body.job_id:
+        raise HTTPException(400, "job_id required")
+    import token_manager
+    r = await token_manager.agent_call("POST", f"/jobs/v0/{body.job_id}/pause-environment")
+    await audit.log(operator=body.operator or "", action="env_pause", job_id=body.job_id,
+                    status_code=r.get("status_code"))
+    return r
+
+
+@api.post("/env/hitl")
+async def env_hitl(body: EnvActionBody):
+    """HITL continue: unstick a hung/paused agent. NOT for poisoned-trajectory wedges."""
+    if not body.job_id:
+        raise HTTPException(400, "job_id required")
+    uid = None
+    try:
+        q = await redash_client.execute(
+            "SELECT created_by FROM jobs WHERE id = '{{ job }}'",
+            {"job": body.job_id}, data_source_id=JOBS_DS_ID)
+        row = _first(q.get("rows", []))
+        uid = row.get("created_by") if row else None
+    except Exception:
+        pass
+    if not uid:
+        return {"ok": False, "status_code": 0,
+                "error": "could not resolve user_id for this job (needed for HITL)"}
+    model = body.model or "claude-sonnet-4-5"
+    import datetime as _d
+    _n = _d.datetime.now(_d.timezone.utc)
+    ts = _n.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_n.microsecond // 1000:03d}Z"
+    payload = {"client_ref_id": body.job_id,
+               "payload": {"processor_type": "env_only", "is_cloud": True, "env_image": "",
+                           "branch": "", "repository": "", "task": "continue", "prompt_name": "",
+                           "prompt_version": "latest", "work_space_dir": "", "model_name": model,
+                           "base64_image_list": [], "human_timestamp": ts, "is_pro_user": True,
+                           "thinking_level": "thinking", "user_id": uid},
+               "model_name": model, "resume": True, "id": body.job_id}
+    import token_manager
+    r = await token_manager.agent_call("POST", "/jobs/v0/hitl-queue/", payload)
+    await audit.log(operator=body.operator or "", action="env_hitl", job_id=body.job_id,
+                    status_code=r.get("status_code"), details={"model": model, "user_id": uid})
+    return {**r, "resolved_user_id": uid, "model": model}
+
+
+class DomainBody(BaseModel):
+    user_id: str | None = None
+    domain: str | None = None
+    operator: str | None = None
+
+
+@api.post("/domain/dns")
+async def domain_dns(body: DomainBody):
+    """Domain-only check: what IP / CNAME does this domain currently point to, and does it look Emergent-connected? Pure DNS, no auth."""
+    import socket
+    d = (body.domain or "").strip().rstrip(".")
+    if not d:
+        raise HTTPException(400, "domain required")
+    out = {"domain": d, "a_records": [], "canonical": None, "aliases": [], "connected": False, "target": None, "error": None}
+    try:
+        infos = socket.getaddrinfo(d, None)
+        out["a_records"] = sorted({i[4][0] for i in infos})
+    except Exception as e:
+        out["error"] = str(e)
+    try:
+        name, aliases, addrs = socket.gethostbyname_ex(d)
+        out["canonical"] = name if name and name != d else None
+        out["aliases"] = aliases or []
+    except Exception:
+        pass
+    blob = (" ".join([out.get("canonical") or ""] + (out.get("aliases") or []))).lower()
+    emergent = ("emergent" in blob) or ("emergentagent" in blob) or ("emergent.host" in blob)
+    out["target"] = out.get("canonical") or (out["a_records"][0] if out["a_records"] else None)
+    out["connected"] = bool(out["a_records"])  # resolves = pointing somewhere
+    out["emergent_target"] = emergent
+    try:
+        sq = await redash_client.execute(
+            "SELECT user_id, verified, deleted, provider, cf_ssl_status, cf_custom_hostname_id "
+            "FROM domains WHERE domain_name = '{{ d }}' ORDER BY created_at DESC LIMIT 1",
+            {"d": d}, data_source_id=5)
+        out["system"] = _first(sq.get("rows", []))
+    except Exception:
+        out["system"] = None
+    return out
+
+
+@api.post("/domain/list")
+async def domain_list(body: DomainBody):
+    """List all custom domains owned by user_id (X-User-ID scoped)."""
+    if not body.user_id:
+        raise HTTPException(400, "user_id required")
+    return await deployer_client.domains_list(body.user_id)
+
+
+@api.post("/domain/remove")
+async def domain_remove(body: DomainBody):
+    """Remove a stale/orphan custom domain so the user can re-add it elsewhere."""
+    if not body.domain:
+        raise HTTPException(400, "domain required")
+    uid = body.user_id
+    if not uid:
+        q = await redash_client.execute(
+            "SELECT user_id FROM domains WHERE domain_name = '{{ d }}' ORDER BY created_at DESC LIMIT 1",
+            {"d": body.domain}, data_source_id=5)
+        row = _first(q.get("rows", []))
+        uid = row.get("user_id") if row else None
+    if not uid:
+        return {"ok": False, "status_code": 0,
+                "error": "could not resolve owner for this domain (not in domains table / redash)"}
+    r = await deployer_client.domain_delete(body.domain, uid)
+    await audit.log(operator=body.operator or "", action="domain_remove",
+                    job_id=body.domain, status_code=r.get("status_code"),
+                    details={"user_id": uid, "domain": body.domain})
+    return {**r, "resolved_user_id": uid}
+
+
+STRIPE_BASE = "https://integrations.emergentagent.com"
+
+
+async def _emergent_key_for_job(job_id: str):
+    """job -> owner user_id (DS10) -> customer universal key (DS18 emergent_keys)."""
+    q1 = await redash_client.execute(
+        "SELECT created_by FROM jobs WHERE id = '{{ j }}'", {"j": job_id}, data_source_id=JOBS_DS_ID)
+    row = _first(q1.get("rows", []))
+    uid = row.get("created_by") if row else None
+    if not uid:
+        return None, None
+    q2 = await redash_client.execute(
+        "SELECT emergent_key FROM emergent_keys WHERE user_id = '{{ u }}' ORDER BY updated_at DESC LIMIT 1",
+        {"u": uid}, data_source_id=18)
+    r2 = _first(q2.get("rows", []))
+    return uid, (r2.get("emergent_key") if r2 else None)
+
+
+class StripeBody(BaseModel):
+    job_id: str
+    operator: str | None = None
+
+
+@api.post("/stripe/state")
+async def stripe_state(body: StripeBody):
+    """Read the Stripe sandbox state for a job (customer key scoped)."""
+    uid, key = await _emergent_key_for_job(body.job_id)
+    if not key:
+        return {"ok": False, "status_code": 0, "error": "could not resolve emergent_key for job owner"}
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.get(f"{STRIPE_BASE}/stripe/jobs/{body.job_id}/sandbox",
+                        headers={"Authorization": "Bearer " + key})
+    b = r.json() if "json" in r.headers.get("content-type", "") else r.text[:500]
+    return {"ok": r.status_code < 400, "status_code": r.status_code, "body": b, "user_id": uid}
+
+
+@api.post("/stripe/unlink")
+async def stripe_unlink(body: StripeBody):
+    """Unlink (remove) the Stripe sandbox for a job, then re-check state."""
+    uid, key = await _emergent_key_for_job(body.job_id)
+    if not key:
+        return {"ok": False, "status_code": 0, "error": "could not resolve emergent_key for job owner"}
+    async with httpx.AsyncClient(timeout=30) as c:
+        d = await c.request("DELETE", f"{STRIPE_BASE}/stripe/jobs/{body.job_id}/sandbox",
+                            headers={"Authorization": "Bearer " + key})
+        v = await c.get(f"{STRIPE_BASE}/stripe/jobs/{body.job_id}/sandbox",
+                        headers={"Authorization": "Bearer " + key})
+    db = d.json() if "json" in d.headers.get("content-type", "") else d.text[:400]
+    vb = v.json() if "json" in v.headers.get("content-type", "") else v.text[:400]
+    await audit.log(operator=body.operator or "", action="stripe_unlink", job_id=body.job_id,
+                    status_code=d.status_code, details={"user_id": uid})
+    return {"ok": d.status_code < 400, "status_code": d.status_code, "delete_body": db,
+            "verify_status": v.status_code, "verify_body": vb}
+
+
+# --- DB bulk copy: preview -> production (Last Updated: 2026-08-26) --------
+
+ENVCORE_PROXY = "http://envcore.int-worker.emergentagent.com/api/v1/env/proxy/tools/mcp"
+
+
+async def _dbcopy_targets(job_id: str):
+    """Resolve job_id -> app robustly (direct apps.id, then jobs parent/clone, then user latest)."""
+    async def app_row(sql, params):
+        r = await redash_client.execute(sql, params, data_source_id=5)
+        return _first(r.get("rows", []))
+
+    Q = "SELECT name, user_id, status FROM apps WHERE id = '{{ j }}'"
+    resolved_via = "apps.id"
+    ar = await app_row(Q, {"j": job_id})
+    uid = None
+    if not ar:
+        jr = _first((await redash_client.execute(
+            "SELECT created_by, parent_job_id, cloned_parent_job_id FROM jobs WHERE id = '{{ j }}'",
+            {"j": job_id}, data_source_id=10)).get("rows", []))
+        if jr:
+            uid = jr.get("created_by")
+            for key in ("parent_job_id", "cloned_parent_job_id"):
+                pid = jr.get(key)
+                if pid and not ar:
+                    ar = await app_row(Q, {"j": pid})
+                    if ar:
+                        resolved_via = "jobs." + key
+            if not ar and uid:
+                ar = await app_row(
+                    "SELECT name, user_id, status FROM apps WHERE user_id = '{{ u }}' "
+                    "ORDER BY (status = 'deleted') ASC, updated_at DESC LIMIT 1", {"u": uid})
+                if ar:
+                    resolved_via = "user.latest_app"
+    if not ar:
+        return None
+    slug = ar.get("name"); uid = ar.get("user_id") or uid; status = ar.get("status")
+    murl = dbn = None
+    sec = await redash_client.execute(
+        "SELECT name, value FROM secrets WHERE app_id = '{{ a }}' AND name IN ('MONGO_URL','DB_NAME') "
+        "ORDER BY version DESC", {"a": slug}, data_source_id=5)
+    for row in (sec.get("rows", []) or []):
+        if row.get("name") == "MONGO_URL" and not murl:
+            murl = row.get("value")
+        elif row.get("name") == "DB_NAME" and not dbn:
+            dbn = row.get("value")
+    return {"slug": slug, "user_id": uid, "prod_url": murl, "prod_db": dbn,
+            "resolved_via": resolved_via, "app_status": status}
+
+
+def _parse_pod_stdout(text: str) -> str:
+    import json as _j
+    inner = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = _j.loads(line)
+        except Exception:
+            continue
+        res = obj.get("result") if isinstance(obj, dict) else None
+        if isinstance(res, dict):
+            cont = res.get("content")
+            if isinstance(cont, list) and cont and isinstance(cont[0], dict):
+                t = cont[0].get("text")
+                if t is not None:
+                    inner = t
+    if inner is None:
+        return text[:2000]
+    try:
+        w = _j.loads(inner)
+        if isinstance(w, dict) and "stdout" in w:
+            return w.get("stdout") or ""
+    except Exception:
+        pass
+    return inner
+
+
+async def _pod_exec(slug: str, command: str, timeout: float = 240) -> str:
+    C = {"Content-Type": "application/json",
+         "Accept": "application/json, text/event-stream"}
+    url = f"{ENVCORE_PROXY}?env_key={slug}&port=8010"
+    async with httpx.AsyncClient(timeout=timeout) as c:
+        init = await c.post(url, headers=C, json={"jsonrpc": "2.0", "id": 0,
+            "method": "initialize", "params": {"protocolVersion": "2024-11-05",
+            "capabilities": {}, "clientInfo": {"name": "mbr", "version": "1"}}})
+        sid = init.headers.get("mcp-session-id")
+        H = dict(C)
+        if sid:
+            H["mcp-session-id"] = sid
+        r = await c.post(url, headers=H, json={"jsonrpc": "2.0", "id": 2,
+            "method": "tools/call", "params": {"name": "execute_bash",
+            "arguments": {"command": command, "timeout": int(timeout) - 20}}})
+    return _parse_pod_stdout(r.text)
+
+
+def _copy_script(prod_url: str, prod_db: str, only, mode: str, dry: bool, app_status=None) -> str:
+    import base64 as _b64, json as _j
+    cfg = {"prod_url": prod_url, "prod_db": prod_db, "only": only, "mode": mode, "dry": dry, "app_status": app_status}
+    L = []
+    L.append("import os, json")
+    L.append("from pymongo import MongoClient, ReplaceOne")
+    L.append("CFG = json.loads(%r)" % _j.dumps(cfg))
+    L.append("src = MongoClient('mongodb://localhost:27017', serverSelectionTimeoutMS=8000)")
+    L.append("names = [n for n in src.list_database_names() if n not in ('admin','config','local')]")
+    L.append("pdb = os.environ.get('DB_NAME')")
+    L.append("prev = pdb if pdb in names else (names[0] if names else None)")
+    L.append("if not prev:")
+    L.append("    print(json.dumps({'ok': False, 'error': 'no preview database found'})); raise SystemExit")
+    L.append("sdb = src[prev]")
+    L.append("out = {'ok': True, 'preview_db': prev, 'prod_db': CFG['prod_db'], 'mode': CFG['mode'], 'dry': CFG['dry'], 'collections': {}}")
+    L.append("try:")
+    L.append("    dst = MongoClient(CFG['prod_url'], serverSelectionTimeoutMS=12000)")
+    L.append("    ddb = dst[CFG['prod_db']]")
+    L.append("    dst.admin.command('ping')")
+    L.append("except Exception as e:")
+    L.append("    host = CFG['prod_url'].split('@')[-1].split('/')[0].split('?')[0]")
+    L.append("    msg = 'prod cluster unreachable (TCP timeout / paused / not allowlisted): ' + str(e)[:140]")
+    L.append("    if CFG.get('app_status') == 'deleted': msg += ' | NOTE: app is deleted, so this MONGO_URL is likely a stale/paused cluster.'")
+    L.append("    print(json.dumps({'ok': False, 'error': msg, 'preview_db': prev, 'prod_host': host})); raise SystemExit")
+    L.append("colls = [CFG['only']] if CFG['only'] else sdb.list_collection_names()")
+    L.append("for c in colls:")
+    L.append("    sc = sdb[c].count_documents({})")
+    L.append("    if CFG['dry']:")
+    L.append("        out['collections'][c] = {'src_count': sc, 'prod_count': ddb[c].count_documents({})}")
+    L.append("        continue")
+    L.append("    if CFG['mode'] == 'replace':")
+    L.append("        ddb.drop_collection(c)")
+    L.append("    copied = 0")
+    L.append("    docs = list(sdb[c].find({}))")
+    L.append("    if docs:")
+    L.append("        ops = [ReplaceOne({'_id': d['_id']}, d, upsert=True) for d in docs]")
+    L.append("        for i in range(0, len(ops), 1000):")
+    L.append("            ddb[c].bulk_write(ops[i:i+1000], ordered=False)")
+    L.append("        copied = len(docs)")
+    L.append("    out['collections'][c] = {'copied': copied, 'prod_count_after': ddb[c].count_documents({})}")
+    L.append("print(json.dumps(out))")
+    L.append("src.close(); dst.close()")
+    srcpy = chr(10).join(L)
+    b = _b64.b64encode(srcpy.encode()).decode()
+    return "echo " + b + " | base64 -d | python3 -"
+
+
+async def _dbcopy(job_id: str, only, mode: str, dry: bool):
+    tg = await _dbcopy_targets(job_id)
+    if not tg:
+        jr = _first((await redash_client.execute(
+            "SELECT title, status FROM jobs WHERE id = '{{ j }}'", {"j": job_id},
+            data_source_id=10)).get("rows", []))
+        if jr:
+            return {"ok": False, "error": "job '" + str(jr.get("title")) + "' is " +
+                    str(jr.get("status")) + " and has no deployed app yet (never deployed to "
+                    "production). DB Copy needs a deployed app with a prod database."}
+        return {"ok": False, "error": "job id not found in jobs (DS10) or apps (DS5) - check the id."}
+    if not tg.get("prod_url") or not tg.get("prod_db"):
+        return {"ok": False, "error": "prod MONGO_URL/DB_NAME not found in secrets (app not deployed?)",
+                "slug": tg.get("slug"), "resolved_via": tg.get("resolved_via"), "app_status": tg.get("app_status")}
+    cmd = _copy_script(tg["prod_url"], tg["prod_db"], only, mode, dry, tg.get("app_status"))
+    raw = await _pod_exec(tg["slug"], cmd)
+    import json as _j
+    parsed = None
+    for line in raw.splitlines()[::-1]:
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                parsed = _j.loads(line); break
+            except Exception:
+                pass
+    if parsed is None:
+        return {"ok": False, "error": "could not parse pod output", "slug": tg["slug"], "raw": raw[:800]}
+    parsed["slug"] = tg["slug"]
+    parsed["resolved_via"] = tg.get("resolved_via")
+    parsed["app_status"] = tg.get("app_status")
+    return parsed
+
+
+class DbCopyBody(BaseModel):
+    job_id: str
+    collection: str | None = None
+    mode: str | None = "upsert"
+    operator: str | None = None
+
+
+# --- DB Manager: mongo-viewer-2 proxy (Last Updated: 2026-08-27) ---
+
+import uuid as _uuid
+MV_BASE = "https://mongo-viewer-2.internal.emergent.host/api"
+_mv_sessions = {}
+
+
+# --- DB Manager: DIRECT motor connections (no mongo-viewer-2 proxy) ---------
+# production target -> connect straight to prod_url; preview target -> resolve
+# the slug's pod IP via envcore and connect to mongodb://<pod_ip>:27017.
+import re as _re_db
+
+_ENVCORE_INFO = "http://envcore.int-worker.emergentagent.com/api/v1/env/info"
+_direct_clients = {}
+_preview_url_cache = {}
+
+
+def _jsonify(v):
+    from bson import ObjectId as _OID
+    import datetime as _dtm
+    if isinstance(v, _OID):
+        return str(v)
+    if isinstance(v, (_dtm.datetime, _dtm.date)):
+        return v.isoformat()
+    if isinstance(v, bytes):
+        try:
+            return v.decode("utf-8", "replace")
+        except Exception:
+            return str(v)
+    if isinstance(v, list):
+        return [_jsonify(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _jsonify(x) for k, x in v.items()}
+    return v
+
+
+def _direct_client(url):
+    if not url:
+        return None
+    c = _direct_clients.get(url)
+    if c is None:
+        from motor.motor_asyncio import AsyncIOMotorClient
+        c = AsyncIOMotorClient(url, serverSelectionTimeoutMS=8000, connectTimeoutMS=8000, maxPoolSize=10)
+        _direct_clients[url] = c
+    return c
+
+
+async def _resolve_preview_url(slug, force=False):
+    if not slug:
+        return None, "slug required for preview"
+    if not force and slug in _preview_url_cache:
+        return _preview_url_cache[slug], None
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(_ENVCORE_INFO, params={"env_key": slug})
+    except Exception as e:
+        return None, "envcore unreachable: %s" % e
+    if r.status_code == 404:
+        return None, "App '%s' not found. Wake the env first." % slug
+    if r.status_code != 200:
+        return None, "envcore HTTP %s" % r.status_code
+    ip = (r.json() or {}).get("pod_ip")
+    if not ip:
+        return None, "pod IP not found (wake the env)"
+    url = "mongodb://%s:27017" % ip
+    _preview_url_cache[slug] = url
+    return url, None
+
+
+async def _client_for(slug, prod_url, env, force=False):
+    if env == "production":
+        if not prod_url:
+            return None, "production URL required"
+        return _direct_client(prod_url), None
+    url, err = await _resolve_preview_url(slug, force=force)
+    if err:
+        return None, err
+    return _direct_client(url), None
+
+
+def _oid_or_str(v):
+    from bson import ObjectId as _OID
+    if isinstance(v, str) and _re_db.fullmatch(r"[0-9a-fA-F]{24}", v):
+        try:
+            return _OID(v)
+        except Exception:
+            return v
+    return v
+
+
+async def _mv_connect(slug, prod_url, force=False):
+    targets = []
+    if slug:
+        targets.append("preview")
+    if prod_url:
+        targets.append("production")
+    if not targets:
+        return None, {"status": 400, "text": "slug or production URL required"}
+    last = None
+    ok_any = False
+    for env in targets:
+        client, err = await _client_for(slug, prod_url, env, force=True)
+        if err:
+            last = err
+            continue
+        try:
+            await client.list_database_names()
+            ok_any = True
+        except Exception as e:
+            last = "%s connect failed: %s" % (env, str(e)[:200])
+    if ok_any:
+        return "direct", None
+    psid, pinfo = await _mvp_connect(slug, prod_url, force=True)
+    if psid:
+        return "proxy", None
+    return None, {"status": 400, "text": last or ((pinfo or {}).get("text")) or "connect failed"}
+
+
+async def _mv_req_direct(method, slug, prod_url, path, json_body=None):
+    import json as _jl
+    from urllib.parse import parse_qs as _pq
+    p = path.split("?", 1)
+    parts = [x for x in p[0].split("/") if x]
+    qs = _pq(p[1]) if len(p) > 1 else {}
+    kind = parts[0] if parts else ""
+    try:
+        if kind == "batch":
+            changes = (json_body or {}).get("changes", [])
+            applied = 0
+            failed = 0
+            for ch in changes:
+                try:
+                    client, err = await _client_for(slug, prod_url, ch.get("env") or "preview")
+                    if not client:
+                        failed += 1
+                        continue
+                    coll = client[ch.get("db")][ch.get("collection")]
+                    t = ch.get("type")
+                    if t == "edit":
+                        await coll.update_one({"_id": _oid_or_str(ch.get("docId"))}, {"$set": {ch.get("fieldPath"): ch.get("newValue")}})
+                        applied += 1
+                    elif t == "delete":
+                        await coll.delete_one({"_id": _oid_or_str(ch.get("docId"))})
+                        applied += 1
+                    elif t == "create":
+                        doc = dict(ch.get("document") or {})
+                        doc.pop("_id", None)
+                        await coll.insert_one(doc)
+                        applied += 1
+                except Exception:
+                    failed += 1
+            return {"ok": True, "data": {"applied": applied, "failed": failed, "summary": {"applied": applied, "failed": failed}}}
+        env = parts[1] if len(parts) > 1 else "preview"
+        client, err = await _client_for(slug, prod_url, env)
+        if not client:
+            raise Exception("DIRECT_UNAVAILABLE: " + str(err))
+        if kind == "databases":
+            out = []
+            for n in await client.list_database_names():
+                if n in ("admin", "local", "config"):
+                    continue
+                try:
+                    cc = len(await client[n].list_collection_names())
+                except Exception:
+                    cc = 0
+                out.append({"name": n, "collection_count": cc})
+            return {"ok": True, "data": {"databases": out}}
+        if kind == "collections":
+            db = client[parts[2]]
+            cols = []
+            for cn in await db.list_collection_names():
+                try:
+                    dc = await db[cn].estimated_document_count()
+                except Exception:
+                    dc = 0
+                cols.append({"name": cn, "document_count": dc})
+            return {"ok": True, "data": {"collections": cols}}
+        if kind == "documents":
+            coll = client[parts[2]][parts[3]]
+            skip = int((qs.get("skip") or ["0"])[0])
+            lim = int((qs.get("limit") or ["20"])[0])
+            flt = {}
+            fraw = (qs.get("filter") or [None])[0]
+            if fraw:
+                try:
+                    flt = _jl.loads(fraw)
+                    if isinstance(flt.get("_id"), str):
+                        flt["_id"] = _oid_or_str(flt["_id"])
+                except Exception:
+                    flt = {}
+            total = await coll.count_documents(flt)
+            docs = [_jsonify(d) async for d in coll.find(flt).skip(skip).limit(lim)]
+            tp = max(1, (total + lim - 1) // lim) if lim else 1
+            return {"ok": True, "data": {"documents": docs, "total": total, "total_pages": tp, "current_page": (skip // lim) + 1 if lim else 1}}
+        return {"ok": False, "error": "unsupported path: " + path}
+    except Exception as e:
+        if "timed out" in str(e).lower() or "serverselection" in type(e).__name__.lower() or "direct_unavailable" in str(e).lower():
+            raise
+        return {"ok": False, "error": "mongo op failed", "detail": str(e)[:200]}
+
+
+# --- mongoview proxy (gateway) -> preview (gateway_proxy) + owned production ---
+_MVP_BASE = "https://mongoview.emergent.host/api"
+_mvp_sessions = {}
+_mgv_grant_cache = {"v": None}
+
+
+async def _mgv_grant(force=False):
+    if not force and _mgv_grant_cache["v"] is not None:
+        return _mgv_grant_cache["v"]
+    try:
+        doc = await db["tool_secrets"].find_one({"_id": "mongoview_grant"})
+    except Exception:
+        doc = None
+    g = {"auth_grant": (doc or {}).get("auth_grant") or "", "original_token": (doc or {}).get("original_token") or ""}
+    _mgv_grant_cache["v"] = g
+    return g
+
+
+async def _mvp_connect(slug, prod_url, force=False):
+    key = (slug or "", prod_url or "")
+    if not force and key in _mvp_sessions:
+        return _mvp_sessions[key], None
+    g = await _mgv_grant()
+    if not g.get("auth_grant"):
+        return None, {"status": 0, "text": "no mongoview grant configured"}
+    body = {"preview_app_name": slug or "", "production_url": prod_url or "",
+            "delegation_token": g.get("original_token") or None, "auth_grant": g.get("auth_grant")}
+    try:
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(_MVP_BASE + "/connect", json=body)
+    except Exception as e:
+        return None, {"status": 0, "text": "mongoview unreachable: %s" % e}
+    try:
+        j = r.json()
+    except Exception:
+        return None, {"status": r.status_code, "text": r.text[:200]}
+    if not j.get("success") or not j.get("session_id"):
+        return None, {"status": r.status_code, "text": str(j.get("error") or j)[:300]}
+    _mvp_sessions[key] = j.get("session_id")
+    return j.get("session_id"), j
+
+
+async def _mvp_req(method, slug, prod_url, path, json_body=None):
+    sid, info = await _mvp_connect(slug, prod_url)
+    if not sid:
+        return {"ok": False, "error": "mongoview connect failed", "detail": info}
+    for attempt in (0, 1):
+        try:
+            async with httpx.AsyncClient(timeout=90) as c:
+                r = await c.request(method, _MVP_BASE + path, headers={"X-Session-ID": sid, "Content-Type": "application/json"}, json=json_body)
+        except Exception as e:
+            return {"ok": False, "error": "mongoview request failed", "detail": str(e)[:200]}
+        if r.status_code in (401, 403) and attempt == 0:
+            sid, info = await _mvp_connect(slug, prod_url, force=True)
+            if not sid:
+                return {"ok": False, "error": "reconnect failed", "detail": info}
+            continue
+        if r.status_code != 200:
+            return {"ok": False, "error": "HTTP " + str(r.status_code), "detail": r.text[:200]}
+        return {"ok": True, "data": r.json()}
+    return {"ok": False, "error": "unreachable"}
+
+
+async def _mv_req(method, slug, prod_url, path, json_body=None):
+    # determine env: preview -> straight to mongoview (direct/envcore unreachable from deployed, slow)
+    _p0 = path.split("?", 1)[0]
+    _parts = [x for x in _p0.split("/") if x]
+    _env = None
+    if _parts and _parts[0] == "batch":
+        _chs = (json_body or {}).get("changes") or []
+        _env = (_chs[0].get("env") if _chs else None)
+    elif len(_parts) > 1:
+        _env = _parts[1]
+    if _env == "preview":
+        return await _mvp_req(method, slug, prod_url, path, json_body)
+    try:
+        return await _mv_req_direct(method, slug, prod_url, path, json_body)
+    except Exception as e:
+        _m = str(e).lower()
+        if "timed out" in _m or "serverselection" in type(e).__name__.lower() or "direct_unavailable" in _m:
+            return await _mvp_req(method, slug, prod_url, path, json_body)
+        return {"ok": False, "error": "mongo op failed", "detail": str(e)[:200]}
+
+
+class DbMgrBody(BaseModel):
+    slug: str
+    prod_url: str | None = None
+    target: str | None = "preview"
+    db: str | None = None
+    coll: str | None = None
+    page: int | None = 1
+    limit: int | None = 20
+    filter: str | None = None
+    changes: list | None = None
+    documents: list | None = None
+    operator: str | None = None
+
+
+def _mv_env(target):
+    return "production" if (target or "").lower() == "production" else "preview"
+
+
+async def _mv_databases(slug, prod_url, env):
+    r = await _mv_req("GET", slug, prod_url, "/databases/" + env)
+    if not r.get("ok"):
+        return r
+    dbs = [{"name": d.get("name"), "collections": d.get("collection_count", 0)}
+           for d in (r["data"].get("databases") or [])]
+    return {"ok": True, "databases": dbs}
+
+
+@api.post("/dbmgr/connect")
+async def dbmgr_connect(body: DbMgrBody):
+    prev = {"connected": False, "database_count": 0, "databases": [], "error": None}
+    prod = {"connected": False, "database_count": 0, "databases": [], "error": None}
+    if body.slug:
+        d = await _mv_databases(body.slug, body.prod_url, "preview")
+        if d.get("ok"):
+            prev["connected"] = True
+            prev["databases"] = d.get("databases", [])
+            prev["database_count"] = len(prev["databases"])
+        else:
+            prev["error"] = d.get("detail") or d.get("error")
+    if body.prod_url:
+        d = await _mv_databases(body.slug, body.prod_url, "production")
+        if d.get("ok"):
+            prod["connected"] = True
+            prod["databases"] = d.get("databases", [])
+            prod["database_count"] = len(prod["databases"])
+        else:
+            prod["error"] = d.get("detail") or d.get("error")
+    if not prev["connected"] and not prod["connected"]:
+        return {"ok": False, "error": "connect failed", "detail": (prod["error"] or prev["error"])}
+    return {"ok": True, "slug": body.slug, "preview": prev, "production": (prod if body.prod_url else None)}
+
+
+@api.post("/dbmgr/databases")
+async def dbmgr_databases(body: DbMgrBody):
+    return await _mv_databases(body.slug, body.prod_url, _mv_env(body.target))
+
+
+@api.post("/dbmgr/collections")
+async def dbmgr_collections(body: DbMgrBody):
+    r = await _mv_req("GET", body.slug, body.prod_url, "/collections/" + _mv_env(body.target) + "/" + (body.db or ""))
+    if not r.get("ok"):
+        return r
+    cols = [{"name": c.get("name"), "count": c.get("document_count", 0)}
+            for c in (r["data"].get("collections") or [])]
+    return {"ok": True, "collections": cols}
+
+
+def _norm_filter(f):
+    """Accept raw Mongo JSON, a bare _id/hex, or plain text (regex across common fields)."""
+    import json as _j, re as _re
+    if not f:
+        return None
+    f = f.strip()
+    if not f:
+        return None
+    try:
+        obj = _j.loads(f)
+        if isinstance(obj, dict):
+            return _j.dumps(obj)
+    except Exception:
+        pass
+    if _re.fullmatch(r"[0-9a-fA-F]{24}", f):
+        return _j.dumps({"_id": f})
+    rx = {"$regex": _re.escape(f), "$options": "i"}
+    return _j.dumps({"$or": [{"_id": f}, {"id": rx}, {"name": rx}, {"title": rx}, {"text": rx}, {"email": rx}, {"status": rx}]})
+
+
+@api.post("/dbmgr/documents")
+async def dbmgr_documents(body: DbMgrBody):
+    _lim = body.limit or 20
+    _skip = ((body.page or 1) - 1) * _lim
+    q = "?skip=" + str(_skip) + "&limit=" + str(_lim)
+    nf = _norm_filter(body.filter)
+    if nf:
+        import urllib.parse as _u
+        q += "&filter=" + _u.quote(nf)
+    path = "/documents/" + _mv_env(body.target) + "/" + (body.db or "") + "/" + (body.coll or "") + q
+    r = await _mv_req("GET", body.slug, body.prod_url, path)
+    if not r.get("ok"):
+        return r
+    d = r["data"]
+    return {"ok": True, "documents": d.get("documents", []), "total": d.get("total", 0),
+            "total_pages": d.get("total_pages", 1), "current_page": d.get("current_page", body.page or 1)}
+
+
+@api.post("/dbmgr/apply")
+async def dbmgr_apply(body: DbMgrBody):
+    env = _mv_env(body.target)
+    mv_changes = []
+    for ch in (body.changes or []):
+        op = ch.get("op") or ch.get("type")
+        base = {"id": str(_uuid.uuid4()), "env": env, "db": ch.get("db"), "collection": ch.get("collection")}
+        if op in ("edit", "update"):
+            mv_changes.append({**base, "type": "edit", "docId": ch.get("docId"),
+                               "fieldPath": ch.get("field"), "oldValue": ch.get("oldValue"), "newValue": ch.get("value")})
+        elif op == "delete":
+            mv_changes.append({**base, "type": "delete", "docId": ch.get("docId")})
+        elif op in ("insert", "create"):
+            mv_changes.append({**base, "type": "create", "document": ch.get("document")})
+    r = await _mv_req("POST", body.slug, body.prod_url, "/batch/apply", {"changes": mv_changes})
+    try:
+        await audit.log(operator=body.operator or "", action="dbmgr_apply", job_id=body.slug,
+                        status_code=200 if r.get("ok") else 0,
+                        details={"target": env, "changes": len(mv_changes)})
+    except Exception:
+        pass
+    if not r.get("ok"):
+        return r
+    return {"ok": True, **r["data"]}
+
+
+async def _mv_dump_coll(slug, prod_url, env, db, coll, cap=200000):
+    docs = []
+    skip = 0
+    while True:
+        r = await _mv_req("GET", slug, prod_url,
+                          "/documents/" + env + "/" + db + "/" + coll + "?skip=" + str(skip) + "&limit=500")
+        if not r.get("ok"):
+            return r
+        d = r["data"]
+        batch = d.get("documents", [])
+        docs.extend(batch)
+        if not d.get("has_next") or not batch or len(docs) >= cap:
+            break
+        skip += 500
+    return {"ok": True, "documents": docs}
+
+
+@api.post("/dbmgr/dump")
+async def dbmgr_dump(body: DbMgrBody):
+    env = _mv_env(body.target)
+    if body.coll:
+        r = await _mv_dump_coll(body.slug, body.prod_url, env, body.db, body.coll)
+        if not r.get("ok"):
+            return r
+        return {"ok": True, "target": env, "db": body.db, "coll": body.coll,
+                "count": len(r["documents"]), "documents": r["documents"]}
+    rc = await _mv_req("GET", body.slug, body.prod_url, "/collections/" + env + "/" + (body.db or ""))
+    if not rc.get("ok"):
+        return rc
+    import io as _io, zipfile as _zip, base64 as _b64, json as _json
+    total = 0
+    counts = {}
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w", _zip.ZIP_DEFLATED) as zf:
+        for c in (rc["data"].get("collections") or []):
+            name = c.get("name")
+            r = await _mv_dump_coll(body.slug, body.prod_url, env, body.db, name)
+            docs = r.get("documents", []) if r.get("ok") else []
+            zf.writestr(name + ".json", _json.dumps(docs, indent=2, ensure_ascii=False))
+            counts[name] = len(docs)
+            total += len(docs)
+    zip_b64 = _b64.b64encode(buf.getvalue()).decode()
+    return {"ok": True, "target": env, "db": body.db, "count": total, "counts": counts, "zip_b64": zip_b64}
+
+
+# --- Access control: admin approval + per-user tabs (Last Updated: 2026-08-28) ---
+
+from datetime import datetime as _dt, timezone as _tz
+
+ADMIN_EMAILS = {"dinakrushna@emergent.sh", "rishav.k@emergent.sh", "vinish@emergent.sh"}
+
+ACCESS_TABS = [
+    {"key": "/diagnose", "label": "Diagnose"},
+    {"key": "/expo", "label": "Find Account"},
+    {"key": "/identity", "label": "Fix App Identity"},
+    {"key": "/keystore", "label": "Keystore Manager"},
+    {"key": "/creds", "label": "Creds & Retry (iOS)"},
+    {"key": "/fingerprint", "label": "Signing Fingerprint"},
+    {"key": "/pem", "label": "PEM / KMS Tools"},
+    {"key": "/forkchain", "label": "Fork Chain"},
+    {"key": "/domain", "label": "Domain Remove"},
+    {"key": "/stripe", "label": "Stripe Sandbox"},
+    {"key": "/env-wake", "label": "Wake / Restart"},
+    {"key": "/env-kick", "label": "Kick"},
+    {"key": "/env-bump", "label": "Bump to large"},
+    {"key": "/env-hitl", "label": "HITL continue"},
+    {"key": "/dbmgr", "label": "DB Manager"},
+    {"key": "/export", "label": "BSON Export"},
+]
+ALL_TAB_KEYS = [t["key"] for t in ACCESS_TABS]
+
+
+def _is_admin(user):
+    return (getattr(user, "email", "") or "").lower() in ADMIN_EMAILS
+
+
+def _now_iso():
+    return _dt.now(_tz.utc).isoformat()
+
+
+@api.get("/access/me")
+async def access_me(user: auth_mod.User = protected):
+    email = (user.email or "").lower()
+    if _is_admin(user):
+        return {"email": email, "name": user.name, "is_admin": True, "status": "approved",
+                "allowed_tabs": ALL_TAB_KEYS, "tabs": ACCESS_TABS}
+    doc = await db.tool_access.find_one({"_id": email})
+    if not doc:
+        doc = {"_id": email, "email": email, "name": user.name, "picture": user.picture,
+               "status": "pending", "allowed_tabs": [], "created_at": _now_iso(), "updated_at": _now_iso()}
+        try:
+            await db.tool_access.insert_one(doc)
+        except Exception:
+            pass
+    return {"email": email, "name": user.name, "is_admin": False,
+            "status": doc.get("status", "pending"), "allowed_tabs": doc.get("allowed_tabs", []),
+            "tabs": ACCESS_TABS}
+
+
+@api.get("/access/requests")
+async def access_requests(user: auth_mod.User = protected):
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail="admin only")
+    rows = []
+    async for d in db.tool_access.find({}).sort("updated_at", -1):
+        rows.append({"email": d.get("email"), "name": d.get("name"), "picture": d.get("picture"),
+                     "status": d.get("status"), "allowed_tabs": d.get("allowed_tabs", []),
+                     "approved_by": d.get("approved_by"), "updated_at": d.get("updated_at")})
+    return {"ok": True, "admins": sorted(ADMIN_EMAILS), "tabs": ACCESS_TABS, "requests": rows}
+
+
+class AccessDecision(BaseModel):
+    email: str
+    tabs: list | None = None
+    status: str | None = "approved"
+
+
+@api.post("/access/approve")
+async def access_approve(body: AccessDecision, user: auth_mod.User = protected):
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail="admin only")
+    email = (body.email or "").lower()
+    if not email:
+        return {"ok": False, "error": "email required"}
+    tabs = [t for t in (body.tabs or []) if t in ALL_TAB_KEYS]
+    status = body.status if body.status in ("approved", "denied", "pending") else "approved"
+    if status != "approved":
+        tabs = []
+    await db.tool_access.update_one(
+        {"_id": email},
+        {"$set": {"email": email, "status": status, "allowed_tabs": tabs,
+                  "approved_by": (user.email or "").lower(), "updated_at": _now_iso()}},
+        upsert=True)
+    return {"ok": True, "email": email, "status": status, "allowed_tabs": tabs}
+
+
+@api.post("/dbmgr/import")
+async def dbmgr_import(body: DbMgrBody):
+    """Bulk import with de-dupe: skip docs whose _id already exists, insert only new ones."""
+    env = _mv_env(body.target)
+    docs = body.documents or []
+    if not docs:
+        return {"ok": False, "error": "no documents to import"}
+    if not body.db or not body.coll:
+        return {"ok": False, "error": "db and collection required"}
+    existing = set()
+    skip = 0
+    while True:
+        r = await _mv_req("GET", body.slug, body.prod_url,
+                          "/documents/" + env + "/" + body.db + "/" + body.coll + "?skip=" + str(skip) + "&limit=500")
+        if not r.get("ok"):
+            break
+        d = r["data"]
+        batch = d.get("documents", [])
+        for x in batch:
+            if isinstance(x, dict) and x.get("_id") is not None:
+                existing.add(str(x["_id"]))
+        if not d.get("has_next") or not batch:
+            break
+        skip += 500
+    to_insert = []
+    skipped = 0
+    for doc in docs:
+        _id = doc.get("_id") if isinstance(doc, dict) else None
+        if _id is not None and str(_id) in existing:
+            skipped += 1
+            continue
+        to_insert.append(doc)
+    inserted = 0
+    failed = 0
+    for i in range(0, len(to_insert), 100):
+        chunk = to_insert[i:i + 100]
+        changes = [{"id": str(_uuid.uuid4()), "type": "create", "env": env,
+                    "db": body.db, "collection": body.coll, "document": doc} for doc in chunk]
+        rr = await _mv_req("POST", body.slug, body.prod_url, "/batch/apply", {"changes": changes})
+        if rr.get("ok"):
+            summ = (rr["data"] or {}).get("summary") or {}
+            inserted += summ.get("successful", 0)
+            failed += summ.get("failed", 0)
+        else:
+            failed += len(chunk)
+    try:
+        await audit.log(operator=body.operator or "", action="dbmgr_import", job_id=body.slug,
+                        status_code=200, details={"target": env, "coll": body.coll,
+                        "inserted": inserted, "skipped": skipped, "failed": failed})
+    except Exception:
+        pass
+    return {"ok": True, "inserted": inserted, "skipped": skipped, "failed": failed, "total": len(docs)}
+
+
+@api.post("/dbcopy/inspect")
+async def dbcopy_inspect(body: DbCopyBody):
+    return await _dbcopy(body.job_id, body.collection, "upsert", True)
+
+
+@api.post("/dbcopy/run")
+async def dbcopy_run(body: DbCopyBody):
+    mode = "replace" if (body.mode or "").lower() == "replace" else "upsert"
+    r = await _dbcopy(body.job_id, body.collection, mode, False)
+    try:
+        await audit.log(operator=body.operator or "", action="dbcopy_run", job_id=body.job_id,
+                        status_code=200 if r.get("ok") else 0,
+                        details={"collection": body.collection or "ALL", "mode": mode})
+    except Exception:
+        pass
+    return r
+
+
+@api.post("/fingerprint/lookup")
+async def fingerprint_lookup(body: JobBody):
+    r = await redash_client.execute(Q_FINGERPRINT_UNION, {"job": body.job_id})
+    return {"rows": r.get("rows", []), "query": Q_FINGERPRINT_UNION,
+            "ok": r["ok"], "error": r.get("error")}
+
+
+@api.post("/fingerprint/from-url")
+async def fingerprint_from_url(body: FingerprintUrlBody):
+    try:
+        fp = await signing.fingerprints_from_url(body.url)
+    except Exception as e:
+        raise HTTPException(400, f"Fingerprint failed: {e}")
+    return fp
+
+
+@api.post("/fingerprint/from-upload")
+async def fingerprint_from_upload(file: UploadFile = File(...)):
+    content = await file.read()
+    try:
+        fp = signing.fingerprints_from_bytes(content)
+    except Exception as e:
+        raise HTTPException(400, f"Fingerprint failed: {e}")
+    return fp
+
+
+# --- PEM / KMS tools ------------------------------------------------------
+
+@api.post("/pem/extract-upload-key")
+async def extract_upload_key(body: ExtractUploadKeyBody):
+    # 1. read encrypted password from DB
+    r_pw = await redash_client.execute(Q_KEYSTORE_PW, {"job": body.job_id})
+    row = _first(r_pw.get("rows", []))
+    if not row or not row.get("keystore_password"):
+        raise HTTPException(404, "No keystore_password row for that job_id")
+    encrypted = row["keystore_password"]
+
+    # 2. KMS decrypt
+    dec = await kms_shell.kms_decrypt(encrypted)
+    if not dec["reachable"] or not dec["ok"]:
+        await audit.log(operator=body.operator or "", action="pem_extract_upload_key",
+                        job_id=body.job_id, status_code=None,
+                        details={"stage": "decrypt", "error": dec.get("error")})
+        return {"stage": "decrypt", "reachable": dec["reachable"],
+                "ok": False, "error": dec.get("error"),
+                "note": "KMS decrypt requires kubectl + VPN. In prod this "
+                        "runs against the deployer pod."}
+
+    # 3. gsutil cp
+    tmpdir = tempfile.mkdtemp(prefix="mbr-pem-")
+    p12 = os.path.join(tmpdir, "keystore.p12")
+    ds = await kms_shell.gsutil_download_keystore(body.job_id, p12)
+    if not ds["reachable"] or not ds["ok"]:
+        return {"stage": "gsutil", **ds}
+
+    # 4. openssl -> PEM
+    pemres = await kms_shell.openssl_p12_to_pem(p12, dec["plaintext"] or "")
+    try:
+        os.unlink(p12)
+    except OSError:
+        pass
+
+    await audit.log(operator=body.operator or "", action="pem_extract_upload_key",
+                    job_id=body.job_id, status_code=None,
+                    details={"ok": pemres["ok"]})
+
+    return {"stage": "done", **pemres}
+
+
+@api.post("/pem/encrypt-p8")
+async def encrypt_p8(operator: str = Form(""), p8_file: UploadFile = File(...)):
+    content = await p8_file.read()
+    r = await kms_shell.kms_encrypt_p8(content)
+    await audit.log(operator=operator, action="p8_encrypt",
+                    job_id=None, status_code=None,
+                    details={"filename": p8_file.filename, "ok": r.get("ok")})
+    return r
+
+
+@api.post("/pem/force-regen")
+async def force_regen(body: ForceRegenBody):
+    if body.platform == "ios":
+        r = await redash_client.execute(Q_FORCE_REGEN_IOS, {"job": body.job_id})
+    elif body.platform == "android":
+        r = await redash_client.execute(Q_FORCE_REGEN_ANDROID, {"job": body.job_id})
+    else:
+        raise HTTPException(400, "platform must be 'ios' or 'android'")
+
+    await audit.log(operator=body.operator or "", action=f"force_regen_{body.platform}",
+                    job_id=body.job_id, status_code=None,
+                    details={"error": r.get("error")})
+    return r
+
+
+# --- generic MCP passthrough (advanced) -----------------------------------
+
+JOBS_DS_ID = int(os.environ.get("JOBS_DS_ID", "10"))
+
+Q_FORKCHAIN_UP = """
+WITH RECURSIVE up AS (
+  SELECT id, title, status, parent_job_id, cloned_parent_job_id, created_at, 0 AS depth
+  FROM jobs WHERE id = \'{{ job }}\'
+  UNION ALL
+  SELECT j.id, j.title, j.status, j.parent_job_id, j.cloned_parent_job_id, j.created_at, up.depth + 1
+  FROM jobs j JOIN up ON j.id = COALESCE(up.parent_job_id, up.cloned_parent_job_id)
+  WHERE up.depth < 10
+)
+SELECT id, title, status, parent_job_id, cloned_parent_job_id, created_at, depth
+FROM up ORDER BY depth
+""".strip()
+
+Q_FORKCHAIN_CHILDREN = """
+SELECT id, title, status, parent_job_id, cloned_parent_job_id, created_at
+FROM jobs
+WHERE parent_job_id = \'{{ job }}\' OR cloned_parent_job_id = \'{{ job }}\'
+ORDER BY created_at DESC
+LIMIT 50
+""".strip()
+
+
+@api.post("/forkchain")
+async def forkchain(body: JobBody):
+    """Show a job's fork/clone lineage: its ancestors (parent chain up to the
+    original) and its direct children, so you can see where this session's job
+    is connected. Reads the jobs table (DS10)."""
+    up = await redash_client.execute(Q_FORKCHAIN_UP, {"job": body.job_id},
+                                     data_source_id=JOBS_DS_ID)
+    ch = await redash_client.execute(Q_FORKCHAIN_CHILDREN, {"job": body.job_id},
+                                     data_source_id=JOBS_DS_ID)
+    chain = up.get("rows", []) or []
+    if not chain:
+        return {"found": False,
+                "reason": "job not found in jobs table (check the id)",
+                "job_id": body.job_id, "error": up.get("error")}
+
+    node = chain[0]
+    ancestors = chain[1:]          # nearest parent first, original last
+    children = ch.get("rows", []) or []
+    root = ancestors[-1] if ancestors else node
+
+    if ancestors:
+        summary = ("Forked from '" + str(root.get("title")) + "' ("
+                   + str(root.get("id")) + "). "
+                   + str(len(ancestors)) + " ancestor(s), "
+                   + str(len(children)) + " child(ren).")
+    else:
+        summary = ("Root job - not forked from anything. "
+                   + str(len(children)) + " child(ren).")
+
+    return {
+        "found": True,
+        "job": node,
+        "ancestors": ancestors,
+        "children": children,
+        "root": root,
+        "summary": summary,
+    }
+
+
+SUPRSEND_DS_ID = int(os.environ.get("SUPRSEND_DS_ID", "18"))
+
+Q_OWNER_SLUGS = """
+SELECT title FROM jobs
+WHERE created_by = (SELECT created_by FROM jobs WHERE id = \'{{ job }}\')
+  AND title IS NOT NULL
+""".strip()
+
+
+@api.post("/suprsend")
+async def suprsend_lookup(body: JobBody):
+    """Which of this job owner's app slugs is connected to SuprSend (push relay)?
+    Resolve every slug the owner has (jobs.title, DS10), then look them up in the
+    push_apps / push_apps_suprsend tables (DS18 integration-proxy)."""
+    if not body.job_id:
+        return {"found": False, "error": "job_id required"}
+    sq = await redash_client.execute(Q_OWNER_SLUGS, {"job": body.job_id},
+                                     data_source_id=JOBS_DS_ID)
+    if not sq.get("ok"):
+        return {"found": False, "error": sq.get("error") or "slug query failed"}
+    slugs = [r.get("title") for r in (sq.get("rows", []) or []) if r.get("title")]
+    # keep real slugs only (drop the job's own untitled UUID rows), dedup, cap
+    uniq = [x for x in dict.fromkeys(slugs)
+            if not re.fullmatch(r"[0-9a-fA-F-]{36}", x or "")][:500]
+    if not uniq:
+        return {"found": False, "job_id": body.job_id,
+                "reason": "no named app slugs found for this job's owner."}
+
+    inlist = ", ".join("'" + x.replace("'", "''") + "'" for x in uniq)
+    q = ("SELECT p.app_id, p.provider, s.workspace_slug, s.provisioned_at "
+         "FROM push_apps p "
+         "LEFT JOIN push_apps_suprsend s ON s.push_app_id = p.id "
+         "WHERE p.app_id IN (" + inlist + ")")
+    pr = await redash_client.execute(q, data_source_id=SUPRSEND_DS_ID)
+    if not pr.get("ok"):
+        return {"found": False, "error": pr.get("error") or "push_apps query failed",
+                "slug_count": len(uniq)}
+    rows = pr.get("rows", []) or []
+    connected = [r for r in rows if r.get("workspace_slug")]
+    return {
+        "found": True,
+        "job_id": body.job_id,
+        "slug_count": len(uniq),
+        "push_apps": rows,
+        "suprsend_connected": connected,
+        "note": ((str(len(connected)) + " slug(s) connected to SuprSend.")
+                 if connected else
+                 "None of this owner's slugs are connected to SuprSend."),
+    }
+
+
+@api.post("/mcp/deployer")
+async def mcp_deployer(body: McpToolBody):
+    return await mcp_client.deployer_tool(body.tool, body.args)
+
+
+@api.post("/mcp/expo")
+async def mcp_expo(body: McpToolBody):
+    return await mcp_client.expo_tool(body.tool, body.args)
+
+
+# --- audit ----------------------------------------------------------------
+
+@api.get("/audit")
+async def audit_recent(limit: int = 100):
+    return {"entries": await audit.recent(min(max(1, limit), 500))}
+
+
+# --- health / config -------------------------------------------------------
+
+@public_api.get("/health")
+async def health():
+    return {
+        "ok": True,
+        "redash_configured": bool(os.environ.get("REDASH_URL") and os.environ.get("REDASH_API_KEY")),
+        "deployer_configured": bool(os.environ.get("DEPLOYER_URL")),
+        "deployer_mcp_configured": bool(os.environ.get("DEPLOYER_MCP_URL")),
+        "expo_mcp_configured": bool(os.environ.get("EXPO_MCP_URL")),
+        "expo_mcp_authed": bool(os.environ.get("EXPO_MCP_TOKEN")),
+        "auth_allowed_domain": os.environ.get("AUTH_ALLOWED_DOMAIN", "emergent.sh"),
+    }
+
+
+@public_api.get("/")
+async def root():
+    return {"service": "mobile-build-resolver", "ok": True}
+
+
+# --- auth -----------------------------------------------------------------
+
+@public_api.post("/auth/session")
+async def auth_session(request: Request, response: Response):
+    """Exchange a one-time session_id (from Emergent Auth) for a persistent session.
+
+    Enforces the @emergent.sh allowlist. Sets an HttpOnly cookie and also returns
+    the session_token so programmatic clients can use Bearer auth.
+    """
+    sid = request.headers.get("X-Session-ID") or ""
+    if not sid:
+        # Fallback: also accept in JSON body for clients that can't set headers
+        try:
+            body = await request.json()
+            sid = body.get("session_id") or ""
+        except Exception:
+            pass
+    if not sid:
+        raise HTTPException(400, "Missing X-Session-ID header")
+
+    data = await auth_mod.exchange_session_id(sid)
+    email = (data.get("email") or "").strip()
+    auth_mod.enforce_domain(email)
+
+    user_id = await auth_mod.create_or_update_user(
+        db,
+        email=email,
+        name=data.get("name") or email,
+        picture=data.get("picture"),
+    )
+    token = data.get("session_token") or ""
+    if not token:
+        raise HTTPException(502, "Emergent Auth returned no session_token")
+    await auth_mod.store_session(db, user_id, token)
+    auth_mod.set_session_cookie(response, token)
+
+    return {
+        "user_id": user_id,
+        "email": email,
+        "name": data.get("name") or email,
+        "picture": data.get("picture"),
+    }
+
+
+@public_api.get("/auth/me")
+async def auth_me(user: auth_mod.User = protected):
+    return {
+        "user_id": user.user_id,
+        "email": user.email,
+        "name": user.name,
+        "picture": user.picture,
+    }
+
+
+@public_api.post("/auth/logout")
+async def auth_logout(
+    response: Response,
+    session_token: str | None = Cookie(default=None),  # noqa: F821
+    authorization: str | None = Header(default=None),  # noqa: F821
+):
+    token = auth_mod._extract_token(session_token, authorization)
+    if token:
+        await auth_mod.delete_session(db, token)
+    auth_mod.clear_session_cookie(response)
+    return {"ok": True}
+
+
+# --- mount ----------------------------------------------------------------
+
+
+# --- runtime bearer push (emergent.sh token-sync userscript) ---------------
+@public_api.post("/admin/bearer")
+async def admin_push_bearer(request: Request):
+    """Accept a fresh Supabase access_token from an admin's browser (token-sync).
+    Secured by the posted token itself: must decode to an admin email, be unexpired,
+    and be accepted live by agent-service. No separate ingest secret."""
+    import json as _j, base64 as _b64, time as _t, httpx as _hx
+    import token_manager
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    tok = ((body or {}).get("access_token") or "").strip()
+    if not tok or tok.count(".") != 2:
+        raise HTTPException(400, "missing access_token")
+    def _claim(t, k):
+        try:
+            p = t.split(".")[1]; p += "=" * (-len(p) % 4)
+            return _j.loads(_b64.urlsafe_b64decode(p)).get(k)
+        except Exception:
+            return None
+    email = (_claim(tok, "email") or "").lower()
+    try:
+        exp = float(_claim(tok, "exp") or 0)
+    except Exception:
+        exp = 0.0
+    if email not in ADMIN_EMAILS:
+        raise HTTPException(403, "token email not an admin: %s" % (email or "(none)"))
+    if exp <= _t.time():
+        raise HTTPException(400, "token already expired")
+    try:
+        async with _hx.AsyncClient(timeout=15) as c:
+            r = await c.post("https://api.emergent.sh/jobs/v0/auth-probe-nonexistent-000/restart-environment?upgrade=false&source=l2_tool",
+                             headers={"authorization": "Bearer " + tok, "content-type": "application/json"}, json={})
+    except Exception as e:
+        raise HTTPException(502, "verify failed: %s" % e)
+    if r.status_code == 401:
+        raise HTTPException(401, "token rejected by agent-service")
+    res = await token_manager.set_pushed_bearer(tok)
+    if not res.get("ok"):
+        raise HTTPException(500, res.get("error") or "store failed")
+    return {"ok": True, "email": email, "exp": exp, "seconds_left": int(exp - _t.time()), "verified_status": r.status_code}
+
+
+@public_api.get("/admin/bearer/status")
+async def admin_bearer_status():
+    import token_manager
+    return await token_manager.bearer_status()
+
+
+
+# --- BSON export (deployer internal mongo export) ---------------------------
+class ExportBody(BaseModel):
+    identifier: str | None = None
+    slug: str | None = None
+    job_id: str | None = None
+    operator: str | None = None
+
+
+async def _deployer_internal(method, path, operator, json_body=None, timeout=12, base=None):
+    import os as _os, httpx as _hx, token_manager
+    base = (base or _os.environ.get("DEPLOYER_URL", "")).rstrip("/")
+    if not base:
+        return {"ok": False, "error": "DEPLOYER_URL not configured", "status_code": 0}
+    t = await token_manager.get_token()
+    headers = {"content-type": "application/json", "X-Internal-User": "true"}
+    if operator:
+        headers["X-User-ID"] = operator
+    if t.get("ok"):
+        headers["authorization"] = "Bearer " + t["access_token"]
+    try:
+        async with _hx.AsyncClient(timeout=timeout, follow_redirects=False) as c:
+            r = await c.request(method, base + path, headers=headers, json=json_body)
+    except Exception as e:
+        return {"ok": False, "error": "deployer unreachable: %s" % e, "status_code": 0}
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text[:800]
+    return {"ok": r.status_code < 400, "status_code": r.status_code, "body": body}
+
+
+@api.post("/export/resolve")
+async def export_resolve(body: ExportBody, user: auth_mod.User = protected):
+    slug = (body.identifier or "").strip()
+    if not slug:
+        return {"ok": False, "error": "slug required"}
+    op = (body.operator or user.email or "").strip()
+    return await _deployer_internal("GET", "/api/v1/deployments/slug/" + slug, op)
+
+
+import os as _os_exp
+_EXPORT_BASE = _os_exp.environ.get("MONGO_EXPORT_BASE", "https://deployer.int.apis.emergentagent.com")
+
+
+@api.post("/export/create")
+async def export_create(body: ExportBody, user: auth_mod.User = protected):
+    # Current deployer API is app-scoped: POST /api/internal/mongo/export/apps/{app-slug}
+    slug = (getattr(body, "slug", None) or "").strip()
+    ident = (body.identifier or "").strip()
+    if not (slug or ident):
+        return {"ok": False, "error": "app slug or deployment id required"}
+    op = (body.operator or user.email or "").strip()
+    paths = []
+    if ident:
+        paths.append("/api/internal/mongo/export/deployments/" + ident)
+    if slug:
+        paths.append("/api/internal/mongo/export/apps/" + slug)
+    if ident:
+        paths.append("/api/internal/mongo/export/apps/" + ident)
+    last = None
+    for base in [_EXPORT_BASE, _os_exp.environ.get("DEPLOYER_URL", "")]:
+        if not base:
+            continue
+        for p in paths:
+            r = await _deployer_internal("POST", p, op, json_body={}, base=base)
+            last = r
+            if r.get("status_code") and r.get("status_code") != 404:
+                return r
+    return last or {"ok": False, "error": "export API not reachable on any deployer base"}
+
+
+@api.post("/export/status")
+async def export_status(body: ExportBody, user: auth_mod.User = protected):
+    jid = (body.job_id or "").strip()
+    if not jid:
+        return {"ok": False, "error": "job_id required"}
+    op = (body.operator or user.email or "").strip()
+    return await _deployer_internal("GET", "/api/internal/mongo/export/jobs/" + jid, op, base=_EXPORT_BASE)
+
+
+@api.post("/export/link")
+async def export_link(body: ExportBody, user: auth_mod.User = protected):
+    jid = (body.job_id or "").strip()
+    if not jid:
+        return {"ok": False, "error": "job_id required"}
+    op = (body.operator or user.email or "").strip()
+    return await _deployer_internal("POST", "/api/internal/mongo/export/jobs/" + jid + "/download", op, json_body={}, base=_EXPORT_BASE)
+
+
+@public_api.post("/admin/mongoview-grant")
+async def admin_mongoview_grant(request: Request):
+    import time as _t
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ag = ((body or {}).get("auth_grant") or "").strip()
+    ot = ((body or {}).get("original_token") or "").strip()
+    if not ag:
+        raise HTTPException(400, "auth_grant required")
+    await db["tool_secrets"].update_one({"_id": "mongoview_grant"}, {"$set": {"auth_grant": ag, "original_token": ot, "updated_at": _t.time()}}, upsert=True)
+    try:
+        _mgv_grant_cache["v"] = {"auth_grant": ag, "original_token": ot}
+        _mvp_sessions.clear()
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+app.include_router(public_api)
+app.include_router(api)
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origin_regex=os.environ.get("CORS_ORIGIN_REGEX", "https?://.*"),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    client.close()

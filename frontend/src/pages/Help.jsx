@@ -64,12 +64,28 @@ const SECTIONS = [
     "Import (upload icon): bulk import from a JSON file or paste. Documents whose _id already exists are skipped, only new ones are added, so no duplicates are created.",
     "Dump (download icon): export a single collection as .json, or use Dump full DB in the navigator to export the whole database as one .zip with a separate .json per collection.",
   ], note: "Production goes through the allowlisted mongo-viewer-2 backend. For preview, that app's preview pod must be awake." },
-  { id: "access", title: "Access management (admin)", what: "Admins control who can use the tool and which tabs each person sees.", steps: [
-    "The Requests section lists pending users. Click Approve on the right.",
-    "In the popup, select the tabs for that user (with All / None shortcuts) and click Done.",
-    "The Approved section keeps the history (who got what, and who granted it). Use Edit to change a user's tabs.",
-    "Use the search box to find a user by name or email.",
-  ], note: "Only the three admins can see this. Access is enforced in both the UI and the backend." },
+  { id: "export", title: "BSON Export", what: "Generate a downloadable BSON export (database dump) of an app without asking engineering.", steps: [
+    "Enter the app slug and click Resolve to get its deployment id.",
+    "Click Create export. The export job runs and its status updates inline.",
+    "When the status is ready, use the download link to get the BSON archive.",
+  ], note: "Safe for L1 and L2 to self serve. The export is read only, it never changes the app data." },
+  { id: "domainfix", title: "Domain Fix / SSL", what: "Repair a custom domain that shows Deployment not found, and re run SSL and domain verification for the customer.", steps: [
+    "Enter the domain or app and click Check status to see the Cloudflare hostname, SSL state and the appName metadata.",
+    "Click Fix mapping to patch the hostname metadata to the right deployment name. It asks for confirmation first.",
+    "To re run verification, fill the domain, the app it points at, and the Trinity ticket, then click Verify domain.",
+  ], note: "ssl_pending means DNS is right and the certificate is still issuing. Check status again after about 30 seconds, do not ask the customer to change anything." },
+  { id: "dns", title: "DNS Records", what: "Read and edit A, CNAME, TXT and MX records on a domain bought through Emergent, including repointing it to Render, Vercel or the customer's own server.", steps: [
+    "Always click Read zone first, and again after every change, to see the real records.",
+    "Add a record: pick the type, host and value. For @, *, www or an Emergent linked subdomain, tick allow hosting change. For an apex MX, tick allow apex MX.",
+    "Delete a record: copy the exact stored value from the zone, then delete one record at a time.",
+  ], note: "Only Emergent bought domains. A CNAME cannot share a host with another record. CNAME at the apex is refused. This never changes nameservers." },
+  { id: "cachepurge", title: "Cache Purge", what: "Purge an app's crawler (SEO prerender) cache so the next crawl re renders every path.", steps: [
+    "Enter the app name, app id, or custom domain and click Purge cache.",
+    "Fix the upstream cause first (an edge challenge, WAF rule, or proxied DNS), or the next crawl re caches the same bad response.",
+  ], note: "A status of purged or nothing_cached is clean. Any incomplete status means the cache was not fully seen, so do not report it as clear." },
+  { id: "secrets", title: "Secrets Viewer", what: "Read only view of an app's deployed secret names and masked values.", steps: [
+    "Enter the app name and click View secrets. It works even if the app was deleted.",
+  ], note: "This tab can only read. Values come back masked and there is no way to change a secret from here." },
 ];
 
 export default function Help() {

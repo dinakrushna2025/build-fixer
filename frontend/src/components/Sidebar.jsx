@@ -3,10 +3,12 @@ import { NavLink } from "react-router-dom";
 import {
   Stethoscope, Search, Fingerprint, KeyRound, RefreshCw, FileKey2, ShieldAlert,
   GitFork, Power, Globe, CreditCard, Zap, Cpu, RotateCw, HardDrive, Terminal,
-  PanelLeftClose, PanelLeftOpen, ShieldCheck,
+  PanelLeftClose, PanelLeftOpen, ShieldCheck, DatabaseBackup,
+  Wrench, Network, Eraser, Lock,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAccess } from "@/context/AccessContext";
+import { safeCall, api } from "@/api";
 
 const NAV = [
   { to: "/diagnose", label: "Diagnose", icon: Stethoscope, testId: "nav-diagnose" },
@@ -20,10 +22,14 @@ const NAV = [
   { to: "/domain", label: "Domain Remove", icon: Globe, testId: "nav-domain" },
   { to: "/stripe", label: "Stripe Sandbox", icon: CreditCard, testId: "nav-stripe" },
   { to: "/env-wake", label: "Wake / Restart", icon: Power, testId: "nav-env-wake" },
-  { to: "/env-kick", label: "Kick", icon: Zap, testId: "nav-env-kick" },
   { to: "/env-bump", label: "Bump to large", icon: Cpu, testId: "nav-env-bump" },
   { to: "/env-hitl", label: "HITL continue", icon: RotateCw, testId: "nav-env-hitl" },
   { to: "/dbmgr", label: "DB Manager", icon: HardDrive, testId: "nav-dbmgr" },
+  { to: "/export", label: "BSON Export", icon: DatabaseBackup, testId: "nav-export" },
+  { to: "/domainfix", label: "Domain Fix / SSL", icon: Wrench, testId: "nav-domainfix" },
+  { to: "/dns", label: "DNS Records", icon: Network, testId: "nav-dns" },
+  { to: "/cachepurge", label: "Cache Purge", icon: Eraser, testId: "nav-cachepurge" },
+  { to: "/secrets", label: "Secrets Viewer", icon: Lock, testId: "nav-secrets" },
 ];
 
 export default function Sidebar() {
@@ -33,6 +39,21 @@ export default function Sidebar() {
   const isAdmin = !!access?.is_admin;
   const allowed = new Set(access?.allowed_tabs || []);
   const items = NAV.filter((n) => isAdmin || allowed.has(n.to));
+
+  const [pending, setPending] = React.useState(0);
+  React.useEffect(() => {
+    if (!isAdmin) return;
+    let alive = true;
+    const poll = async () => {
+      const r = await safeCall(() => api.get("/access/requests"));
+      if (!alive || !r.ok) return;
+      const reqs = r.data?.requests || [];
+      setPending(reqs.filter((u) => u.status === "pending").length);
+    };
+    poll();
+    const id = setInterval(poll, 30_000);
+    return () => { alive = false; clearInterval(id); };
+  }, [isAdmin]);
 
   return (
     <aside
@@ -49,7 +70,7 @@ export default function Sidebar() {
               <Terminal className="h-4 w-4" strokeWidth={2.5} />
             </div>
             <div className="leading-tight">
-              <div className="text-sm font-semibold tracking-tight">Mobile Build Resolver</div>
+              <div className="text-sm font-semibold tracking-tight">Support Build Resolver</div>
               <div className="text-[10px] text-muted-foreground mono uppercase tracking-widest">support tools</div>
             </div>
           </>
@@ -97,13 +118,23 @@ export default function Sidebar() {
             data-testid="nav-access"
             title="Access requests"
             className={({ isActive }) => cn(
-              "w-full flex items-center rounded-md text-sm",
+              "relative w-full flex items-center rounded-md text-sm",
               open ? "gap-3 px-3 py-2" : "justify-center px-0 py-2",
               isActive ? "bg-primary/10 text-primary font-medium" : "text-foreground/80 hover:text-foreground hover:bg-secondary",
             )}
           >
             <ShieldCheck className="h-4 w-4 shrink-0 text-primary" />
             {open && <span>Access requests</span>}
+            <span
+              data-testid="access-badge"
+              className={cn(
+                "grid place-items-center rounded-full text-[10px] font-semibold leading-none text-white min-w-[18px] h-[18px] px-1",
+                pending > 0 ? "bg-red-500" : "bg-emerald-500",
+                open ? "ml-auto" : "absolute top-0.5 right-0.5",
+              )}
+            >
+              {pending}
+            </span>
           </NavLink>
         </div>
       )}

@@ -71,7 +71,7 @@ export default function AuthCallback() {
         clearPending();
         // navigate() replaces the URL (including the fragment) — no need for
         // an explicit history.replaceState any more.
-        navigate("/diagnose", { replace: true, state: { user: r.data } });
+        navigate("/", { replace: true, state: { user: r.data } });
       } catch (e) {
         clearPending();
         const detail =

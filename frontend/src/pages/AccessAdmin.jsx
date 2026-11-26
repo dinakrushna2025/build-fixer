@@ -8,6 +8,8 @@ import { useAccess } from "@/context/AccessContext";
 import { toast } from "sonner";
 import { Loader2, Search, Check, X, Pencil, ShieldCheck } from "lucide-react";
 
+const PAGE_SIZE = 6;
+
 export default function AccessAdmin() {
   const acc = useAccess();
   const isAdmin = !!acc?.access?.is_admin;
@@ -15,18 +17,27 @@ export default function AccessAdmin() {
   const [tabs, setTabs] = React.useState([]);
   const [reqs, setReqs] = React.useState([]);
   const [q, setQ] = React.useState("");
-  const [popup, setPopup] = React.useState(null); // {email, name, sel:Set, mode}
+  const [popup, setPopup] = React.useState(null);
   const [busy, setBusy] = React.useState(false);
+  const [apPage, setApPage] = React.useState(0);
+  const [rjPage, setRjPage] = React.useState(0);
 
-  const load = React.useCallback(async () => {
-    setLoading(true);
+  const load = React.useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     const r = await safeCall(() => api.get("/access/requests"));
-    setLoading(false);
-    if (!r.ok) return toast.error(r.error || "Failed to load");
+    if (!silent) setLoading(false);
+    if (!r.ok) { if (!silent) toast.error(r.error || "Failed to load"); return; }
     setTabs(r.data.tabs || []);
     setReqs(r.data.requests || []);
   }, []);
   React.useEffect(() => { if (isAdmin) load(); }, [isAdmin, load]);
+  // auto reload: refresh the request list in the background so new requests and
+  // granted access show up without a manual refresh
+  React.useEffect(() => {
+    if (!isAdmin) return;
+    const id = setInterval(() => { load(true); }, 15000);
+    return () => clearInterval(id);
+  }, [isAdmin, load]);
 
   if (!isAdmin) {
     return <div className="py-16 text-center text-muted-foreground">Admins only.</div>;
@@ -38,8 +49,16 @@ export default function AccessAdmin() {
     if (!s) return true;
     return (u.name || "").toLowerCase().includes(s) || (u.email || "").toLowerCase().includes(s);
   };
-  const pending = reqs.filter((u) => u.status !== "approved" && match(u));
+  const pending = reqs.filter((u) => u.status === "pending" && match(u));
   const approved = reqs.filter((u) => u.status === "approved" && match(u));
+  const rejected = reqs.filter((u) => u.status === "denied" && match(u));
+
+  const apPages = Math.max(1, Math.ceil(approved.length / PAGE_SIZE));
+  const rjPages = Math.max(1, Math.ceil(rejected.length / PAGE_SIZE));
+  const apP = Math.min(apPage, apPages - 1);
+  const rjP = Math.min(rjPage, rjPages - 1);
+  const apView = approved.slice(apP * PAGE_SIZE, apP * PAGE_SIZE + PAGE_SIZE);
+  const rjView = rejected.slice(rjP * PAGE_SIZE, rjP * PAGE_SIZE + PAGE_SIZE);
 
   const openPopup = (u, mode) => setPopup({ email: u.email, name: u.name, mode, sel: new Set(u.allowed_tabs || []) });
   const toggle = (key) => setPopup((p) => {
@@ -74,15 +93,30 @@ export default function AccessAdmin() {
             {u.approved_by && <span className="text-[10px] text-muted-foreground">by {u.approved_by}</span>}
           </div>
         )}
+        {u.status === "denied" && u.approved_by && (
+          <div className="text-[10px] text-muted-foreground mt-1">denied by {u.approved_by}</div>
+        )}
       </div>
-      <span className={"ml-2 text-[10px] px-2 py-0.5 rounded-full shrink-0 " + (u.status === "approved" ? "bg-emerald-500/15 text-emerald-600" : u.status === "denied" ? "bg-red-500/15 text-red-600" : "bg-amber-500/15 text-amber-600")}>{u.status}</span>
-      <div className="ml-auto flex items-center gap-2 shrink-0">{actions}</div>
+      <div className="ml-auto flex items-center gap-2 shrink-0">
+        <span className={"text-[10px] px-2 py-0.5 rounded-full " + (u.status === "approved" ? "bg-emerald-500/15 text-emerald-600" : u.status === "denied" ? "bg-red-500/15 text-red-600" : "bg-amber-500/15 text-amber-600")}>{u.status}</span>
+        {actions}
+      </div>
     </div>
+  );
+
+  const Pager = ({ page, pages, setPage }) => (
+    pages <= 1 ? null : (
+      <div className="flex items-center justify-end gap-2 pt-1">
+        <Button size="sm" variant="outline" disabled={page <= 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>Prev</Button>
+        <span className="text-[11px] text-muted-foreground">{page + 1} / {pages}</span>
+        <Button size="sm" variant="outline" disabled={page >= pages - 1} onClick={() => setPage((p) => Math.min(pages - 1, p + 1))}>Next</Button>
+      </div>
+    )
   );
 
   return (
     <div className="space-y-5">
-      <PageHeader title="Access management" subtitle="Approve who can use the tool and pick exactly which tabs each person sees. Approved history is kept below and stays editable." />
+      <PageHeader title="Access management" subtitle="Approve who can use the tool and pick exactly which tabs each person sees. Approved and rejected history is kept below and stays editable." />
 
       <div className="flex items-center gap-2 max-w-md">
         <Search className="h-4 w-4 text-muted-foreground" />
@@ -108,11 +142,23 @@ export default function AccessAdmin() {
           <Card><CardContent className="p-4 space-y-2">
             <div className="text-xs uppercase tracking-wider text-muted-foreground">Approved ({approved.length})</div>
             {!approved.length && <p className="text-sm text-muted-foreground">No one approved yet.</p>}
-            {approved.map((u) => (
+            {apView.map((u) => (
               <Row key={u.email} u={u} actions={
                 <Button size="sm" variant="outline" onClick={() => openPopup(u, "edit")} data-testid={"edit-" + u.email}><Pencil className="h-3.5 w-3.5" /> Edit</Button>
               } />
             ))}
+            <Pager page={apP} pages={apPages} setPage={setApPage} />
+          </CardContent></Card>
+
+          <Card><CardContent className="p-4 space-y-2">
+            <div className="text-xs uppercase tracking-wider text-muted-foreground">Rejected ({rejected.length})</div>
+            {!rejected.length && <p className="text-sm text-muted-foreground">No one rejected.</p>}
+            {rjView.map((u) => (
+              <Row key={u.email} u={u} actions={
+                <Button size="sm" variant="outline" onClick={() => openPopup(u, "approve")} data-testid={"reapprove-" + u.email}><Check className="h-3.5 w-3.5" /> Approve</Button>
+              } />
+            ))}
+            <Pager page={rjP} pages={rjPages} setPage={setRjPage} />
           </CardContent></Card>
         </>
       )}
